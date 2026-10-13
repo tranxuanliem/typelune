@@ -1,0 +1,2 @@
+# Preserve the exact whitespace in upstream license notices.
+THIRD_PARTY_NOTICES.txt -whitespace
