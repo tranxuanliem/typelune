@@ -18,7 +18,7 @@ struct SnippetListView: View {
         .onDeleteCommand {
             if let id = model.snippetSelection { model.delete(id) }
         }
-        .searchable(text: $model.searchText, prompt: "Title, abbreviation, text or tag")
+        .searchable(text: $model.searchText, prompt: "Search snippets")
         .navigationTitle(model.selectedGroup?.name ?? "All Snippets")
         .navigationSubtitle("\(rows.count) snippets")
         .overlay {
@@ -44,23 +44,31 @@ private struct SnippetRowView: View {
     let showsGroup: Bool
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(row.abbreviation.isEmpty ? "—" : row.abbreviation)
-                .font(.body.monospaced())
-                // Hierarchical styles let List adapt colours on the selection highlight.
-                .foregroundStyle(row.active ? .primary : .secondary)
-                .frame(minWidth: 56, alignment: .leading)
-                .lineLimit(1)
-            VStack(alignment: .leading, spacing: 2) {
+        HStack(alignment: .center, spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(row.name)
                     .foregroundStyle(row.active ? .primary : .secondary)
                     .lineLimit(1)
-                if showsGroup {
-                    Text(row.groupName)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                HStack(spacing: 6) {
+                    if row.abbreviation.isEmpty {
+                        Text("No abbreviation")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text(row.abbreviation)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 4))
+                    }
+                    if showsGroup {
+                        Text(row.groupName)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
+                .lineLimit(1)
             }
             Spacer(minLength: 0)
             if !row.active {
@@ -76,7 +84,7 @@ private struct SnippetRowView: View {
                     .accessibilityLabel("Warning")
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 3)
         .accessibilityElement(children: .combine)
     }
 }

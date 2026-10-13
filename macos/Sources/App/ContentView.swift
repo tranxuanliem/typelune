@@ -22,7 +22,7 @@ struct ContentView: View {
                 ContentUnavailableView {
                     Label("No Snippet Selected", systemImage: "text.cursor")
                 } description: {
-                    Text("Select a snippet, or create one with ⌘N.")
+                    Text("Choose a snippet, or press ⌘N for a new one.")
                 } actions: {
                     Button("New Snippet") { model.newSnippet() }
                 }
@@ -93,31 +93,32 @@ private struct MainToolbar: ToolbarContent {
 
     var body: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            Button("New Snippet", systemImage: "square.and.pencil") { model.newSnippet() }
-                .help("New Snippet (⌘N)")
-            Menu("Library", systemImage: "ellipsis.circle") {
+            Button {
+                openWindow(id: WindowID.systemWide)
+            } label: {
+                Label(stateTitle, systemImage: nativeSymbol)
+                    .labelStyle(.titleAndIcon)
+            }
+            .help("System-wide expansion: \(stateTitle). Click for details.")
+            .accessibilityLabel("System-wide expansion: \(stateTitle)")
+            Menu {
                 Button("New Group", systemImage: "folder.badge.plus") { model.newGroup() }
                 Divider()
                 Button("Import Library…", systemImage: "square.and.arrow.down") { model.showImporter = true }
                 Button("Export Library…", systemImage: "square.and.arrow.up") { model.exportLibrary() }
-                Divider()
                 Button("Backups…", systemImage: "clock.arrow.circlepath") { openWindow(id: WindowID.backups) }
-            }
-            .help("Groups, import and export")
-            Button("Playground", systemImage: "keyboard") { openWindow(id: WindowID.playground) }
-                .help("Try expansions in a scratch area (⌥⌘P)")
-            Button {
-                openWindow(id: WindowID.systemWide)
+                Divider()
+                Button("Playground", systemImage: "keyboard") { openWindow(id: WindowID.playground) }
             } label: {
-                Label(nativeTitle, systemImage: nativeSymbol)
+                Label("Library", systemImage: "ellipsis.circle")
             }
-            .help("System-wide expansion: \(nativeTitle)")
+            .help("Groups, import and export, backups and Playground")
+            Button("New Snippet", systemImage: "square.and.pencil") { model.newSnippet() }
+                .help("New Snippet (⌘N)")
         }
     }
 
-    private var nativeTitle: String {
-        "System-wide: \(model.native?.state.title ?? "Off")"
-    }
+    private var stateTitle: String { model.native?.state.title ?? "Off" }
 
     private var nativeSymbol: String {
         switch model.native?.state {
