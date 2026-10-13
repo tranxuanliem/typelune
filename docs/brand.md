@@ -48,3 +48,17 @@ appear only in the icon and in documentation art. The wordmark is never set in S
 The icon source and system typography follow Apple’s [app icon guidance](https://developer.apple.com/design/human-interface-guidelines/app-icons) and [typography guidance](https://developer.apple.com/design/human-interface-guidelines/typography). Classic ICNS is the current deliverable; modern Icon Composer layers are source artwork for a future signed release.
 
 The name was selected with Claude Opus 5.5 after rejecting software name collisions. Limited web, GitHub and US Mac App Store searches on 2026-10-13 found no obvious exact software-name match for Typelune.
+
+## Identity map
+
+| Surface | Canonical spelling |
+|---|---|
+| App, menus, executable | `Typelune` |
+| App bundle | `Typelune.app` |
+| Project folder, T3 project, GitHub repository | `typelune` |
+| Rust package / library | `typelune-core` / `typelune_core` |
+| Swift app / bridge | `TypeluneApp` / `TypeluneCore` |
+| C API / header | `tpl_*` / `typelune_core.h` |
+| Bundle identity | `io.github.tranxuanliem.typelune` |
+
+The pre-0.3 data-folder alias and v1 format literal remain only for compatibility, as documented in architecture.md.

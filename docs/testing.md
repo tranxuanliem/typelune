@@ -68,5 +68,13 @@ These need a person at the Mac:
 - file panels;
 - system-wide expansion in real apps.
 
-System-wide expansion was checked by hand in Apple Notes with a physical keyboard during
-development. Re-check it after any change to `src/native/`.
+System-wide expansion in v0.2.0 was checked by hand in Apple Notes with a physical keyboard. The v0.3.0 naming update keeps the injection behavior, but its new bundle identity needs a fresh Accessibility grant before repeating that test. Re-check after any change to `src/native/`.
+
+## v0.3.0 local validation
+
+- Rust: 99 unit tests, 6 end-to-end tests, 11 C ABI tests, and 3 keyboard-layout checks passed.
+- Swift: all 42 bridge checks passed, plus strict formatting and warnings-as-errors typechecking.
+- Source identity, detector self-test, bundle identity and ad-hoc signature verification passed.
+- A build from a source folder containing spaces passed without embedded personal home paths.
+- Visible UI: About shows Typelune 0.3.0 and the new icon; Playground expands the English and Vietnamese example rules.
+- First-launch migration was checked byte for byte against the original file, which remained unchanged. System-wide expansion remained off.
