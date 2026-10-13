@@ -276,3 +276,127 @@ fn stop_without_running_tap_is_immediate_and_keeps_core_usable() {
         "ok"
     );
 }
+
+#[test]
+fn preferences_live_in_the_data_folder_with_safe_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path());
+    let p = core.ok(json!({"cmd": "preferences_get"}));
+    assert_eq!(p["isolated"], true, "an explicit folder is isolated");
+    assert_eq!(p["writable"], true);
+    assert_eq!(p["preferences"]["start_expansion_at_launch"], false);
+    assert_eq!(p["preferences"]["excluded_apps"], json!([]));
+    assert!(
+        !dir.path().join("preferences.json").exists(),
+        "reading never writes"
+    );
+    let mut prefs = p["preferences"].clone();
+    prefs["excluded_apps"] = json!([{"bundle_id": "com.example.Editor", "name": "Editor"}]);
+    core.ok(json!({"cmd": "preferences_set", "preferences": prefs}));
+    assert!(dir.path().join("preferences.json").exists());
+    let mut bad = prefs.clone();
+    bad["excluded_apps"] = json!([{"bundle_id": "not a bundle id"}]);
+    assert!(core
+        .err(json!({"cmd": "preferences_set", "preferences": bad}))
+        .contains("not a valid bundle identifier"));
+    drop(core);
+    let again = Core::open(dir.path());
+    let p = again.ok(json!({"cmd": "preferences_get"}));
+    assert_eq!(
+        p["preferences"]["excluded_apps"][0]["bundle_id"],
+        "com.example.Editor"
+    );
+}
+
+#[test]
+fn backup_now_list_preview_and_restore_keep_the_current_library_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path());
+    let original = core.ok(json!({"cmd": "state"}))["library"].clone();
+    let made = core.ok(json!({"cmd": "backup_now"}));
+    let name = made["created"].as_str().unwrap().to_owned();
+    assert_eq!(made["backups"].as_array().unwrap().len(), 1);
+    assert_eq!(made["retention"], 30);
+
+    let mut edited = original.clone();
+    edited["groups"][0]["name"] = json!("Edited");
+    core.ok(json!({"cmd": "update_library", "library": edited}));
+    let preview = core.ok(json!({"cmd": "backup_read", "name": name}));
+    assert_eq!(preview["library"], original);
+
+    let restored = core.ok(json!({"cmd": "backup_restore", "name": name}));
+    assert_eq!(restored["library"], original);
+    let pre = restored["pre_restore"].as_str().unwrap().to_owned();
+    assert!(pre.ends_with("-pre-restore.json"));
+    // The pre-restore snapshot holds the edited library: restoring it is the way back.
+    let kept = core.ok(json!({"cmd": "backup_read", "name": pre}));
+    assert_eq!(kept["library"]["groups"][0]["name"], "Edited");
+
+    // Bad names and damaged snapshots fail closed and change nothing.
+    assert!(core
+        .err(json!({"cmd": "backup_restore", "name": "../library.json"}))
+        .contains("not a Typelune backup"));
+    let damaged = dir
+        .path()
+        .join("backups/library-20200101-000000-manual.json");
+    std::fs::write(&damaged, "{ broken").unwrap();
+    assert!(core.ok(json!({"cmd": "backup_list"}))["backups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["name"] == "library-20200101-000000-manual.json"));
+    core.err(json!({"cmd": "backup_restore", "name": "library-20200101-000000-manual.json"}));
+    assert_eq!(core.ok(json!({"cmd": "state"}))["library"], original);
+}
+
+#[test]
+fn csv_preview_never_changes_the_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path());
+    let before = core.ok(json!({"cmd": "state"}))["library"].clone();
+    let csv = dir.path().join("in.csv");
+    std::fs::write(
+        &csv,
+        "\u{feff}abbreviation,body,tags\r\nhlo,\"Hi, there\",greeting\r\nnew,\"two\r\nlines\",\r\n,missing,\r\n",
+    )
+    .unwrap();
+    let parsed = core.ok(json!({"cmd": "parse_csv_import", "path": csv.to_str().unwrap()}));
+    assert_eq!(parsed["report"]["imported"], 2);
+    assert_eq!(
+        parsed["report"]["skipped"][0]["line"], 5,
+        "after a two-line record"
+    );
+    assert!(parsed["report"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w["message"].as_str().unwrap().contains("already used")));
+    assert_eq!(parsed["summary"]["snippets"], 2);
+    assert_eq!(core.ok(json!({"cmd": "state"}))["library"], before);
+    // Confirming is the existing merge path.
+    let merged = core.ok(json!({"cmd": "merge_import", "library": parsed["library"]}));
+    assert_eq!(merged["merged"]["snippets"], 2);
+}
+
+#[test]
+fn quick_insert_is_refused_when_expansion_is_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = Core::open(dir.path());
+    let lib = core.ok(json!({"cmd": "state"}))["library"].clone();
+    let id = lib["groups"][0]["snippets"][0]["id"].clone();
+    let err = core.err(json!({"cmd": "native_quick_insert", "token": 1, "snippet_id": id}));
+    assert!(err.contains("off"), "{err}");
+    core.ok(json!({"cmd": "native_release_target"}));
+    core.ok(json!({"cmd": "native_set_frontmost", "pid": 1}));
+    let st = core.ok(json!({"cmd": "native_status"}));
+    assert_eq!(st["state"], "off");
+    assert_eq!(st["stats"]["diag"]["quick_inserts_queued"], 0);
+    // Opening Quick Search suspends automatic matching without changing the run state.
+    let st = core.ok(json!({"cmd": "native_inhibit", "on": true}));
+    assert_eq!(
+        (st["inhibited"].clone(), st["state"].clone()),
+        (json!(true), json!("off"))
+    );
+    let st = core.ok(json!({"cmd": "native_inhibit", "on": false}));
+    assert_eq!(st["inhibited"], false);
+}

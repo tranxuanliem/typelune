@@ -8,6 +8,9 @@ libtypelune_core.a  (Rust, src/)
   engine.rs    matching (triggers, boundaries, longest match, Unicode)
   template.rs  placeholders
   store.rs     JSON persistence, validation, import/export, data-folder resolution
+  backup.rs    dated snapshots (daily, manual, before restore) with retention
+  prefs.rs     preferences.json in the data folder (exclusions, shortcut, start at launch)
+  csv_import.rs  bounded CSV parser and import report
   migrate.rs   one-time copy of the pre-0.3 library
   saver.rs     background save worker
   native/      opt-in system-wide expansion (event tap, injector, safety checks)
@@ -18,10 +21,15 @@ libtypelune_core.a  (Rust, src/)
 
 - **Rust** owns matching, rendering, validation, persistence, import/export, migration and
   system-wide expansion.
-- **SwiftUI** owns the interface:
+- **SwiftUI/AppKit** owns the interface:
   - a three-column `NavigationSplitView` with groups, a searchable list and an editor;
   - toolbar, menus and keyboard shortcuts;
-  - Settings, Playground and System-wide windows;
+  - a `MenuBarExtra` menu; closing the last window keeps the app running there
+    (`applicationShouldTerminateAfterLastWindowClosed` is `false`); only Quit stops it;
+  - Settings, Playground, System-wide and Backups windows;
+  - the Quick Search panel (an `NSPanel` that activates Typelune while open) and its global shortcut (Carbon
+    `RegisterEventHotKey`, exclusive registration);
+  - launch at login through `SMAppService.mainApp`;
   - standard Open/Save panels.
 - The legacy egui UI (`--features legacy-egui`) is a developer fallback. It requires an
   explicit, isolated `TYPELUNE_DATA_DIR` and refuses the real library folders.
@@ -30,6 +38,8 @@ libtypelune_core.a  (Rust, src/)
 
 - **Functions:** `tpl_abi_version`, `tpl_core_open`, `tpl_core_call`, `tpl_core_close`,
   `tpl_string_free`. The ABI version is 2 and lives in `Cargo.toml` and `src/ffi.rs`.
+  v0.4 only adds JSON commands (preferences, backups, CSV, Quick Search), so the ABI
+  version is unchanged.
 - **Errors:** every entry point catches panics and returns errors as JSON. NULL handles
   and strings, invalid UTF-8 and malformed JSON are reported as errors.
 - **Pointer validity:** non-NULL arguments must be valid. A handle must be live (opened and
@@ -42,6 +52,57 @@ libtypelune_core.a  (Rust, src/)
   core checks this.
 - **Swift side:** `TypeluneCore` holds a readers/writer *lifetime lock* across every call,
   so `close` never frees the core while a call is in flight.
+
+## Background features
+
+**Preferences** live in `preferences.json` next to the library, owned by Rust. A run with
+an explicit data folder (`TYPELUNE_DATA_DIR`, tests) therefore has its own preferences
+and never changes the real ones. Such a run is reported as *isolated*, and the app then
+refuses to register a login item. Missing file: defaults, nothing written until a change.
+Corrupt file: defaults, moved aside on the next change. Symbolic link or newer version:
+read-only for the session.
+
+**Start at launch** is a remembered opt-in (default off). It starts expansion only if
+Accessibility is already granted; otherwise it reports why it did not start.
+
+**App exclusions** (bundle identifiers) are checked twice:
+- in the event tap, before a key is recorded or matched: the receiving app is the key
+  event's target PID, else the frontmost app reported by the UI. If exclusions are set and
+  the receiving app is unknown, the key is skipped. Switching apps resets matching;
+- in the injector, right before every synthetic key (see below).
+
+The bundle identifiers of a process come from its executable path (`proc_pidpath`) and the
+enclosing `.app` bundles (CoreFoundation `CFBundle`), cached per PID and re-validated by
+path.
+
+**Quick Search insertion** reuses the injector:
+1. Before the panel opens, automatic matching is suspended (inhibited) so search typing
+   can never expand anything, and the focused app and text element are captured through
+   Accessibility (read-only). An app that does not expose its focused element is
+   Copy-only.
+2. Typelune then activates (`NSApp.activate()`) and the panel becomes key, re-keyed when
+   `didBecomeActive` arrives. An inactive app's panel is not guaranteed to receive
+   keyboard input (v0.4 builds before this change used a non-activating panel, and typing
+   could reach the app underneath). Activation is a request macOS may refuse or delay;
+   until the panel really has the keyboard it shows "Typelune does not have keyboard focus
+   yet", and inhibition keeps any stray keys from expanding.
+3. Focus returns to the original app (`yieldActivation(to:)` + `activate()`) after Escape,
+   the close button, the shortcut, Copy or Insert, but only while Typelune is still
+   frontmost: never over an app the user clicked meanwhile. Clicking away ends the
+   session without moving focus.
+4. On Insert, the panel hides, focus is handed back as above, inhibition is released and
+   Rust checks (running, not paused, fresh token, exact field known, not
+   Typelune, not excluded, no Secure Keyboard Entry). Then the injector waits (bounded,
+   1.5 s) for the exact captured app *and* element to be focused again and types the
+   rendered snippet. Nothing is erased and the clipboard is not used.
+
+**Injection granularity.** All gates (stop, pause, newer input, Secure Keyboard Entry,
+exclusion, and the focused app *and* element) are re-verified immediately before each
+synthetic key event: every Backspace, Return and Left arrow, and every text chunk of up to
+20 UTF-16 units. A single event cannot be checked part-way.
+
+**Backups** are written by Rust into `backups/` in the data folder; see
+[privacy.md](privacy.md#backups).
 
 ## Concurrency
 
@@ -60,9 +121,10 @@ work that must stay on dedicated threads.
 
 ## Data and compatibility
 
-- **Schema:** v1. The on-disk format literal stays `atext-rs.library` for compatibility,
-  and `typelune.library` is also accepted. Renaming the literal is reserved for a v2
-  schema.
+- **Schema:** v1, unchanged in v0.4. The on-disk format literal stays `atext-rs.library`
+  for compatibility, and `typelune.library` is also accepted. Renaming the literal is
+  reserved for a v2 schema. New v0.4 data (exclusions, shortcut, start at launch) is in
+  `preferences.json`, not in the library, so v0.3 reads v0.4 libraries unchanged.
 - **Identifiers:** IDs are UUIDs. Swift keeps them as strings, so the identity is kept
   exactly. Rust writes UUIDs in canonical lowercase form, so an ID written with different
   casing by another tool may change case on the next save.

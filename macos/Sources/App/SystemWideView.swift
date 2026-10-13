@@ -8,7 +8,7 @@ struct SystemWideView: View {
         Form {
             Section {
                 Text(
-                    "When started, Typelune watches key presses in other apps through a macOS event tap and replaces abbreviations. It is off every time the app launches and only starts when you press Start."
+                    "When started, Typelune watches key presses in other apps through a macOS event tap and replaces abbreviations. It is off when the app launches unless you turned on “Start system-wide expansion when Typelune opens” in Settings › General, and it keeps running after you close the window until you press Stop or quit Typelune."
                 )
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -26,7 +26,7 @@ struct SystemWideView: View {
             }
             Section("Privacy") {
                 Text(
-                    "Typed characters are kept only in a 64-character in-memory buffer for matching. Expansion pauses while macOS Secure Keyboard Entry is active; not every application's password field turns that on, so not every password field is detected independently. Typing in Typelune's own windows is ignored. Typelune never changes permissions itself."
+                    "Typed characters are kept only in a 64-character in-memory buffer for matching, cleared when you switch apps or open Quick Search. Expansion pauses while macOS Secure Keyboard Entry is active; not every application's password field turns that on, so not every password field is detected independently. Typing in Typelune's own windows, in Quick Search and in apps excluded in Settings is ignored. Typelune never changes permissions itself."
                 )
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -129,6 +129,9 @@ struct SystemWideView: View {
             if let warning = stats?.lastWarning {
                 LabeledContent("Last Warning", value: warning)
             }
+            if let quick = stats?.lastQuickInsert {
+                LabeledContent("Last Quick Search", value: quick)
+            }
             LabeledContent("Secure-input Skips", value: "\(stats?.secureInputSkips ?? 0)")
             LabeledContent("Tap Re-enabled", value: "\(stats?.tapReenabled ?? 0)")
         }
@@ -179,6 +182,13 @@ private struct DiagnosticsList: View {
                 row("Mouse clicks (reset)", d.mouseResets)
                 row("Clicks that cancelled an expansion", d.mouseDuringInjection)
                 row("Matches queued", d.matchesQueued)
+            }
+            Group {
+                row("Keys in excluded apps (ignored)", d.excludedSkips)
+                row("Keys with unknown target app (ignored)", d.unknownTargetSkips)
+                row("Keys while Quick Search was open (ignored)", d.inhibitedSkips)
+                row("Resets after switching apps", d.focusChangeResets)
+                row("Quick Search insertions queued", d.quickInsertsQueued)
             }
             LabeledContent("Last Cancelling Event", value: d.lastCancelEvent ?? "—")
                 .font(.callout)

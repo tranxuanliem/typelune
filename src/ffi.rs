@@ -17,10 +17,13 @@
 //! `native_start` and `native_refresh_layout`, which must run on the main thread (Carbon
 //! TextInputSources contract). That is checked and reported, never assumed.
 
+use crate::backup::{self, BackupKind};
+use crate::csv_import;
 use crate::engine::{self, Engine, KeyInput, Lint};
 use crate::migrate::{self, MigrationOutcome};
 use crate::model::Library;
 use crate::native::{self, NativeController, NativeState};
+use crate::prefs::{Preferences, PrefsLoad, PrefsStore};
 use crate::saver::{SaveStatus, SaveWorker};
 use crate::store::{self, DataLocation, LoadOutcome, Store};
 use crate::template::{self, RenderContext};
@@ -38,7 +41,10 @@ pub const ABI_VERSION: u32 = 2;
 pub struct TplCore {
     state: Mutex<CoreState>,
     store: Store,
+    prefs_store: PrefsStore,
     load: Value,
+    /// Opened with an explicit data folder (`TYPELUNE_DATA_DIR` or a test folder).
+    isolated: bool,
 }
 
 struct CoreState {
@@ -47,6 +53,8 @@ struct CoreState {
     native: NativeController,
     /// `Err` holds the reason the save thread could not start; edits are then refused.
     saver: Result<SaveWorker, String>,
+    prefs: Preferences,
+    prefs_load: PrefsLoad,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +78,18 @@ enum Request {
     NativeStop,
     NativeRefreshLayout,
     OpenAccessibilitySettings,
+    PreferencesGet,
+    PreferencesSet { preferences: Preferences },
+    BackupList,
+    BackupNow,
+    BackupRead { name: String },
+    BackupRestore { name: String },
+    ParseCsvImport { path: String },
+    NativeSetFrontmost { pid: i32 },
+    NativeCaptureTarget,
+    NativeReleaseTarget,
+    NativeInhibit { on: bool },
+    NativeQuickInsert { token: u64, snippet_id: String },
 }
 
 #[derive(Serialize)]
@@ -144,10 +164,21 @@ impl TplCore {
         };
         load["migration"] = migration;
         load["deprecated_env"] = json!(matches!(location, DataLocation::LegacyEnv(_)));
+        let isolated = !matches!(location, DataLocation::Default { .. });
+        load["isolated"] = json!(isolated);
         let playground = Engine::new(&library);
         let native = NativeController::new(); // OFF: nothing is monitored until native_start.
-                                              // If the library could not be read or migrated, never save the in-memory fallback: it
-                                              // would overwrite (or pre-empt) the user's real library later. Edits fail closed.
+        let prefs_store = PrefsStore::new(location.dir());
+        let (prefs, mut prefs_load) = prefs_store.load();
+        if matches!(
+            load["kind"].as_str(),
+            Some("memory_only") | Some("migration_failed")
+        ) {
+            prefs_load = PrefsLoad::Locked("the library could not be opened".into());
+        }
+        native.set_exclusions(prefs.excluded_set());
+        // If the library could not be read or migrated, never save the in-memory fallback: it
+        // would overwrite (or pre-empt) the user's real library later. Edits fail closed.
         let saver = match load["kind"].as_str() {
             Some("memory_only") | Some("migration_failed") => Err(format!(
                 "saving is disabled to protect your library ({})",
@@ -161,22 +192,152 @@ impl TplCore {
                 playground,
                 native,
                 saver,
+                prefs,
+                prefs_load,
             }),
             store,
+            prefs_store,
             load,
+            isolated,
         }
     }
 
+    fn preferences_json(&self, st: &CoreState) -> Value {
+        let error = match &st.prefs_load {
+            PrefsLoad::Missing | PrefsLoad::Loaded => None,
+            PrefsLoad::Corrupt(e) => Some(format!(
+                "The preferences file could not be read ({e}); defaults are used. It will be set aside on the next change."
+            )),
+            PrefsLoad::Locked(e) => Some(format!("Preferences are read-only this session: {e}")),
+        };
+        json!({
+            "preferences": st.prefs,
+            "error": error,
+            "writable": !matches!(st.prefs_load, PrefsLoad::Locked(_)),
+            "isolated": self.isolated,
+            "path": self.prefs_store.path().display().to_string(),
+        })
+    }
+
+    fn backups_json(&self) -> Result<Value, String> {
+        let list = backup::list(self.store.dir()).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "backups": list,
+            "status": self.store.backup_status(),
+            "folder": backup::backup_dir(self.store.dir()).display().to_string(),
+            "retention": backup::RETENTION,
+        }))
+    }
+
     fn handle(&self, request: Request) -> Result<Value, String> {
-        // Stateless request: parse a file without holding the core lock.
-        if let Request::ParseImport { path } = &request {
-            let lib = store::import_from(std::path::Path::new(path)).map_err(|e| e.to_string())?;
-            let summary = json!({"groups": lib.groups.len(), "snippets": lib.snippet_count()});
-            return Ok(json!({"library": lib, "summary": summary}));
+        // Stateless requests: read files without holding the core lock.
+        match &request {
+            Request::ParseImport { path } => {
+                let lib =
+                    store::import_from(std::path::Path::new(path)).map_err(|e| e.to_string())?;
+                let summary = json!({"groups": lib.groups.len(), "snippets": lib.snippet_count()});
+                return Ok(json!({"library": lib, "summary": summary}));
+            }
+            Request::BackupRead { name } => {
+                let lib = backup::read(self.store.dir(), name).map_err(|e| e.to_string())?;
+                let summary = json!({"groups": lib.groups.len(), "snippets": lib.snippet_count()});
+                return Ok(json!({"library": lib, "summary": summary}));
+            }
+            Request::BackupList => return self.backups_json(),
+            Request::ParseCsvImport { path } => {
+                let mut import = csv_import::import_file(std::path::Path::new(path))
+                    .map_err(|e| e.to_string())?;
+                // Only reads the current library to point out abbreviations already in use.
+                csv_import::note_existing_conflicts(&mut import, &self.lock_state()?.library);
+                let lib = &import.library;
+                let summary = json!({"groups": lib.groups.len(), "snippets": lib.snippet_count()});
+                return Ok(json!({"library": lib, "summary": summary, "report": import.report}));
+            }
+            _ => {}
         }
+        // A restore reads (and validates) the snapshot before taking the lock.
+        let restore = match &request {
+            Request::BackupRestore { name } => {
+                Some(backup::read(self.store.dir(), name).map_err(|e| e.to_string())?)
+            }
+            _ => None,
+        };
         let mut st = self.lock_state()?;
         match request {
-            Request::ParseImport { .. } => unreachable!(),
+            Request::ParseImport { .. }
+            | Request::BackupRead { .. }
+            | Request::BackupList
+            | Request::ParseCsvImport { .. } => unreachable!(),
+            Request::PreferencesGet => Ok(self.preferences_json(&st)),
+            Request::PreferencesSet { preferences } => {
+                self.prefs_store
+                    .save(&preferences, &st.prefs_load)
+                    .map_err(|e| e.to_string())?;
+                st.native.set_exclusions(preferences.excluded_set());
+                st.prefs = preferences;
+                st.prefs_load = PrefsLoad::Loaded;
+                Ok(self.preferences_json(&st))
+            }
+            Request::BackupNow => {
+                if let Err(e) = &st.saver {
+                    return Err(format!("backups are unavailable ({e})"));
+                }
+                let bytes = store::to_json(&st.library).map_err(|e| e.to_string())?;
+                let name = backup::write_snapshot(
+                    self.store.dir(),
+                    BackupKind::Manual,
+                    bytes.as_bytes(),
+                    chrono::Local::now(),
+                )
+                .map_err(|e| e.to_string())?;
+                drop(st);
+                let mut reply = self.backups_json()?;
+                reply["created"] = json!(name);
+                Ok(reply)
+            }
+            Request::BackupRestore { .. } => {
+                let library = restore.expect("read above");
+                if let Err(e) = &st.saver {
+                    return Err(format!("restore is unavailable ({e})"));
+                }
+                // Keep the current library first; if that fails, nothing is restored.
+                let bytes = store::to_json(&st.library).map_err(|e| e.to_string())?;
+                let pre = backup::write_snapshot(
+                    self.store.dir(),
+                    BackupKind::PreRestore,
+                    bytes.as_bytes(),
+                    chrono::Local::now(),
+                )
+                .map_err(|e| format!("the current library could not be backed up first, so nothing was restored: {e}"))?;
+                let mut reply = st.adopt(library)?;
+                reply["library"] = json!(st.library);
+                reply["pre_restore"] = json!(pre);
+                Ok(reply)
+            }
+            Request::NativeSetFrontmost { pid } => {
+                st.native.set_frontmost(pid);
+                Ok(json!({}))
+            }
+            Request::NativeCaptureTarget => Ok(json!(st.native.capture_target()?)),
+            Request::NativeReleaseTarget => {
+                st.native.release_target();
+                Ok(json!({}))
+            }
+            Request::NativeInhibit { on } => {
+                st.native.set_inhibited(on);
+                Ok(native_status(&st.native))
+            }
+            Request::NativeQuickInsert { token, snippet_id } => {
+                let id =
+                    uuid::Uuid::parse_str(&snippet_id).map_err(|_| "unknown snippet".to_owned())?;
+                let (gi, si) = st
+                    .library
+                    .find_snippet(id)
+                    .ok_or("the snippet no longer exists")?;
+                let snippet = st.library.groups[gi].snippets[si].clone();
+                st.native.quick_insert(token, &snippet)?;
+                Ok(native_status(&st.native))
+            }
             Request::State => Ok(json!({
                 "library": st.library,
                 "library_path": self.store.library_path().display().to_string(),
@@ -378,6 +539,7 @@ fn native_status(n: &NativeController) -> Value {
     json!({
         "state": state,
         "error": error,
+        "inhibited": n.is_inhibited(),
         "permissions": n.permissions(),
         "process_path": std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
         "stats": {
@@ -389,6 +551,7 @@ fn native_status(n: &NativeController) -> Value {
             "last_warning": s.last_warning,
             "aborted": s.aborted,
             "last_abort": s.last_abort,
+            "last_quick_insert": s.last_quick_insert,
             "diag": s.diag,
         }
     })

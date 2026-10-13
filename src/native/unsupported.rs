@@ -1,7 +1,8 @@
 //! Fallback for non-macOS targets: native expansion is unavailable.
 
-use super::{NativeState, NativeStats, Permissions};
-use crate::model::Library;
+use super::{CapturedTarget, NativeState, NativeStats, Permissions};
+use crate::model::{Library, Snippet};
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub struct NativeController;
@@ -27,6 +28,19 @@ impl NativeController {
     pub fn set_paused(&mut self, _paused: bool) {}
     pub fn update_library(&self, _library: &Library) {}
     pub fn refresh_keyboard_layout(&self) {}
+    pub fn set_exclusions(&self, _excluded: HashSet<String>) {}
+    pub fn set_frontmost(&self, _pid: i32) {}
+    pub fn capture_target(&self) -> Result<CapturedTarget, String> {
+        Err("Quick Search insertion is only implemented for macOS".into())
+    }
+    pub fn release_target(&self) {}
+    pub fn set_inhibited(&self, _on: bool) {}
+    pub fn is_inhibited(&self) -> bool {
+        false
+    }
+    pub fn quick_insert(&mut self, _token: u64, _snippet: &Snippet) -> Result<(), String> {
+        Err("Quick Search insertion is only implemented for macOS".into())
+    }
     pub fn state(&self) -> NativeState {
         NativeState::Off
     }

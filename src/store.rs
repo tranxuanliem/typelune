@@ -3,8 +3,9 @@
 //! Library lives in `~/Library/Application Support/io.github.tranxuanliem.typelune/library.json`
 //! (override with `TYPELUNE_DATA_DIR`; the pre-0.3 `ATEXT_RS_DATA_DIR` is still honoured but
 //! deprecated). Writes are atomic (temp file + rename) and the previous version is kept as
-//! `library.json.bak`. A library from the pre-0.3 location is copied once by
-//! [`crate::migrate`], never moved or rewritten.
+//! `library.json.bak`. Before the first overwrite of each day, the previous version is also
+//! kept as a dated snapshot in `backups/` (see [`crate::backup`]). A library from the pre-0.3
+//! location is copied once by [`crate::migrate`], never moved or rewritten.
 
 use crate::engine::MAX_ABBREVIATION_CHARS;
 use crate::model::{Library, ACCEPTED_FORMATS, LIBRARY_FORMAT, LIBRARY_VERSION};
@@ -168,11 +169,21 @@ pub enum LoadOutcome {
 #[derive(Debug, Clone)]
 pub struct Store {
     dir: PathBuf,
+    /// Outcome of automatic daily snapshots, shared by clones of this store.
+    backups: std::sync::Arc<std::sync::Mutex<crate::backup::BackupStatus>>,
 }
 
 impl Store {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            backups: Default::default(),
+        }
+    }
+
+    /// Session-only outcome of the automatic daily snapshot.
+    pub fn backup_status(&self) -> crate::backup::BackupStatus {
+        self.backups.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Default location (see [`resolve_data_location`]). Does not migrate; callers that
@@ -269,8 +280,39 @@ impl Store {
         if let Ok(previous) = fs::read(&path) {
             // Best effort, but atomic: the backup is always a complete earlier version.
             let _ = write_atomic(&self.dir.join(format!("{LIBRARY_FILE}.bak")), &previous);
+            self.daily_snapshot(&previous);
         }
         write_atomic(&path, to_json(lib)?.as_bytes())
+    }
+
+    /// Keep the version about to be overwritten as today's snapshot (once per day). A
+    /// failure never blocks saving; it is recorded and shown in the Backups window.
+    fn daily_snapshot(&self, previous: &[u8]) {
+        let now = chrono::Local::now();
+        let day = now.format("%Y%m%d").to_string();
+        let verified = self
+            .backups
+            .lock()
+            .map(|st| st.verified_day.as_deref() == Some(day.as_str()))
+            .unwrap_or(false);
+        if verified {
+            return;
+        }
+        // No lock held during file I/O, so status queries never wait on disk.
+        let result = crate::backup::daily_before_overwrite(&self.dir, previous, now);
+        let Ok(mut status) = self.backups.lock() else {
+            return;
+        };
+        match result {
+            Ok(created) => {
+                if created.is_some() {
+                    status.last_daily = created;
+                }
+                status.last_error = None;
+                status.verified_day = Some(day);
+            }
+            Err(e) => status.last_error = Some(format!("Daily backup failed: {e}")),
+        }
     }
 }
 
@@ -279,21 +321,68 @@ pub fn to_json(lib: &Library) -> Result<String, StoreError> {
 }
 
 pub fn read_library_file(path: &Path) -> Result<Library, StoreError> {
-    let meta = fs::metadata(path).map_err(|source| StoreError::Io {
+    let bytes = read_regular_file(path, MAX_FILE_BYTES, false)?;
+    let text = String::from_utf8(bytes).map_err(|e| StoreError::Io {
+        path: path.to_owned(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+    })?;
+    parse_library(&text)
+}
+
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(target_os = "macos")]
+const O_NONBLOCK: i32 = 0x0004;
+#[cfg(not(target_os = "macos"))]
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(not(target_os = "macos"))]
+const O_NONBLOCK: i32 = 0o4000;
+
+/// Read a regular file of at most `max` bytes. The open never blocks (a named pipe or
+/// device is refused after a non-blocking open instead of waiting for a writer), and with
+/// `no_follow` a symbolic link in the last path component is refused instead of followed.
+pub fn read_regular_file(path: &Path, max: u64, no_follow: bool) -> Result<Vec<u8>, StoreError> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let io = |source| StoreError::Io {
         path: path.to_owned(),
         source,
-    })?;
-    if meta.len() > MAX_FILE_BYTES {
+    };
+    let not_regular = || {
+        StoreError::Invalid(vec![format!(
+            "{} is not a regular file (a link, folder, pipe or device); it was not read",
+            path.display()
+        )])
+    };
+    let flags = O_NONBLOCK | if no_follow { O_NOFOLLOW } else { 0 };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+        .map_err(|e| match e.raw_os_error() {
+            // ELOOP: the last component is a symlink and O_NOFOLLOW was given.
+            Some(62) | Some(40) if no_follow => not_regular(),
+            _ => io(e),
+        })?;
+    let meta = file.metadata().map_err(io)?;
+    if !meta.file_type().is_file() {
+        return Err(not_regular());
+    }
+    if meta.len() > max {
         return Err(StoreError::TooLarge {
             path: path.to_owned(),
             bytes: meta.len(),
         });
     }
-    let text = fs::read_to_string(path).map_err(|source| StoreError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    parse_library(&text)
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take(max + 1).read_to_end(&mut buf).map_err(io)?;
+    if buf.len() as u64 > max {
+        return Err(StoreError::TooLarge {
+            path: path.to_owned(),
+            bytes: buf.len() as u64,
+        });
+    }
+    Ok(buf)
 }
 
 /// Parse and validate library JSON (used for both loading and importing).
@@ -486,7 +575,7 @@ impl Drop for TempSibling {
 }
 
 /// Replace `path` atomically with `contents` (temp file + rename).
-fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
+pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
     let io = |source| StoreError::Io {
         path: path.to_owned(),
         source,
@@ -497,7 +586,7 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
 
 /// Create `path` atomically with `contents`; fails with `AlreadyExists` instead of replacing
 /// anything (temp file + hard link).
-fn write_new_atomic(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
+pub(crate) fn write_new_atomic(path: &Path, contents: &[u8]) -> Result<(), StoreError> {
     let io = |source| StoreError::Io {
         path: path.to_owned(),
         source,
@@ -793,6 +882,29 @@ mod tests {
             ));
         }
         assert!(!is_protected_path(&home.join("Desktop/snippets.json")));
+    }
+
+    #[test]
+    fn named_pipes_are_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("library.json");
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // Would block forever with a plain open/read; must fail fast instead.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let r = read_library_file(&path).is_err() && import_from(&path).is_err();
+            let _ = tx.send(r);
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(true),
+            "refused promptly"
+        );
     }
 
     #[test]

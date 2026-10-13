@@ -31,16 +31,18 @@ struct ContentView: View {
         .toolbar { MainToolbar() }
         .onAppear { model.undoManager = undoManager }
         .onChange(of: undoManager) { _, newValue in model.undoManager = newValue }
-        .fileImporter(isPresented: $model.showImporter, allowedContentTypes: [.json]) { result in
+        .fileImporter(isPresented: $model.showImporter, allowedContentTypes: [.json, .commaSeparatedText]) { result in
             switch result {
             case .success(let url): model.beginImport(url)
             case .failure(let error): model.errorMessage = error.localizedDescription
             }
         }
-        .fileDialogMessage("Choose a Typelune library export (JSON).")
+        .fileDialogMessage("Choose a Typelune library export (JSON) or a CSV file with a header row.")
         .confirmationDialog(
             "Import Library",
-            isPresented: Binding(get: { model.pendingImport != nil }, set: { if !$0 { model.pendingImport = nil } }),
+            isPresented: Binding(
+                get: { model.pendingImport != nil && model.pendingImport?.report == nil },
+                set: { if !$0 { model.pendingImport = nil } }),
             presenting: model.pendingImport
         ) { pending in
             Button("Merge into Library") { model.confirmImport(pending, replace: false) }
@@ -50,6 +52,29 @@ struct ContentView: View {
             Text(
                 "“\(pending.fileName)” contains \(pending.summary.groups) groups and \(pending.summary.snippets) snippets. Merging adds them as new groups; replacing swaps the whole library. Both can be undone."
             )
+        }
+        .sheet(
+            item: Binding(
+                get: { model.pendingImport?.report != nil ? model.pendingImport : nil },
+                set: { if $0 == nil { model.pendingImport = nil } })
+        ) { pending in
+            CsvImportView(pending: pending)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if let message = model.statusMessage {
+                HStack {
+                    Image(systemName: "info.circle").foregroundStyle(.secondary)
+                    Text(message).lineLimit(2)
+                    Spacer()
+                    Button("Dismiss", systemImage: "xmark") { model.statusMessage = nil }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                }
+                .font(.callout)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(.bar)
+            }
         }
         .alert(
             "Something Went Wrong",
@@ -75,6 +100,8 @@ private struct MainToolbar: ToolbarContent {
                 Divider()
                 Button("Import Library…", systemImage: "square.and.arrow.down") { model.showImporter = true }
                 Button("Export Library…", systemImage: "square.and.arrow.up") { model.exportLibrary() }
+                Divider()
+                Button("Backups…", systemImage: "clock.arrow.circlepath") { openWindow(id: WindowID.backups) }
             }
             .help("Groups, import and export")
             Button("Playground", systemImage: "keyboard") { openWindow(id: WindowID.playground) }

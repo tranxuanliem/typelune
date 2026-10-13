@@ -17,6 +17,9 @@ pub mod unsupported;
 #[cfg(not(target_os = "macos"))]
 pub use unsupported::{open_accessibility_settings, NativeController, PendingStop, StopOutcome};
 
+use std::collections::HashSet;
+use std::time::Duration;
+
 /// Marker written into `kCGEventSourceUserData` of every event we post, so our own tap
 /// can recognise and skip synthetic input.
 pub const SYNTHETIC_MARKER: i64 = 0x6174_6578_7273; // fixed value; never change (QA history)
@@ -137,6 +140,8 @@ pub enum AbortReason {
     TargetMismatch,
     /// The focused app is Typelune itself; the in-app editors handle their own text.
     OwnApp,
+    /// The target app is on the exclusion list.
+    ExcludedApp,
 }
 
 impl AbortReason {
@@ -150,6 +155,7 @@ impl AbortReason {
             AbortReason::FocusUnknown => "focused app could not be identified (fail closed)",
             AbortReason::TargetMismatch => "key target app differs from focused app",
             AbortReason::OwnApp => "focused app is Typelune itself (never injected)",
+            AbortReason::ExcludedApp => "the app is excluded in Settings (never injected)",
         }
     }
 }
@@ -162,6 +168,8 @@ pub struct GateSnapshot {
     pub job_generation: u64,
     pub current_generation: u64,
     pub secure_input: bool,
+    /// The target app is excluded by bundle identifier.
+    pub excluded: bool,
     /// `None` = focus could not be determined.
     pub focus_matches: Option<bool>,
 }
@@ -180,11 +188,194 @@ pub fn evaluate_gates(g: &GateSnapshot) -> Result<(), AbortReason> {
     if g.secure_input {
         return Err(AbortReason::SecureInput);
     }
+    if g.excluded {
+        return Err(AbortReason::ExcludedApp);
+    }
     match g.focus_matches {
         Some(true) => Ok(()),
         Some(false) => Err(AbortReason::FocusChanged),
         None => Err(AbortReason::FocusUnknown),
     }
+}
+
+/// Paths of the `.app` bundles that contain `exe_path`, innermost first. A helper app inside
+/// another app yields both, so excluding the outer app also covers its helpers.
+pub fn enclosing_app_bundles(exe_path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut prefix = String::new();
+    for (i, part) in exe_path.split('/').enumerate() {
+        if i > 0 {
+            prefix.push('/');
+        }
+        prefix.push_str(part);
+        if part.len() > 4 && part.ends_with(".app") {
+            out.push(prefix.clone());
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// True if any of `bundle_ids` is in `excluded` (lower-case set). Comparison is
+/// case-insensitive, like bundle identifiers themselves.
+pub fn is_excluded(excluded: &HashSet<String>, bundle_ids: &[String]) -> bool {
+    !excluded.is_empty()
+        && bundle_ids
+            .iter()
+            .any(|id| excluded.contains(&id.to_ascii_lowercase()))
+}
+
+/// Why a real key event is not recorded or matched by the global (automatic) matcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoSkip {
+    Paused,
+    /// The Quick Search panel is open: its search typing must never expand anything.
+    Inhibited,
+    SecureInput,
+    OwnApp,
+    /// Exclusions are set but the receiving app is unknown.
+    UnknownTarget,
+    ExcludedApp,
+}
+
+/// Facts about one real (non-synthetic) key event, gathered by the event tap.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyContext {
+    pub paused: bool,
+    pub inhibited: bool,
+    pub secure_input: bool,
+    /// The receiving app is Typelune itself.
+    pub own_app: bool,
+    /// Receiving app PID (event target, else frontmost); 0 = unknown.
+    pub key_pid: i32,
+    pub exclusions_set: bool,
+    pub excluded: bool,
+}
+
+/// Pure decision for automatic matching; the first applicable reason wins. `None` means
+/// the key may be recorded and matched.
+pub fn auto_skip(k: &KeyContext) -> Option<AutoSkip> {
+    if k.paused {
+        return Some(AutoSkip::Paused);
+    }
+    if k.inhibited {
+        return Some(AutoSkip::Inhibited);
+    }
+    if k.secure_input {
+        return Some(AutoSkip::SecureInput);
+    }
+    if k.own_app {
+        return Some(AutoSkip::OwnApp);
+    }
+    if k.key_pid <= 0 && k.exclusions_set {
+        return Some(AutoSkip::UnknownTarget);
+    }
+    if k.excluded {
+        return Some(AutoSkip::ExcludedApp);
+    }
+    None
+}
+
+/// How long a target captured for Quick Search stays valid.
+pub const MANUAL_TARGET_MAX_AGE: Duration = Duration::from_secs(120);
+
+/// State checked before a Quick Search insertion is queued.
+#[derive(Debug, Clone, Copy)]
+pub struct ManualInsertState {
+    pub running: bool,
+    pub stopping: bool,
+    pub paused: bool,
+    /// Token of the captured target, if one is held.
+    pub held_token: Option<u64>,
+    pub requested_token: u64,
+    pub target_age: Duration,
+    pub excluded: bool,
+    pub secure_input: bool,
+    pub own_app: bool,
+    /// The exact focused text element was captured (not just the app).
+    pub exact_field: bool,
+}
+
+/// Why a Quick Search insertion was refused before anything was queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualRefusal {
+    NotRunning,
+    Paused,
+    NoTarget,
+    StaleTarget,
+    OwnApp,
+    /// Only the app, not the exact field, could be identified.
+    NoExactField,
+    ExcludedApp,
+    SecureInput,
+}
+
+impl ManualRefusal {
+    pub fn describe(self) -> &'static str {
+        match self {
+            ManualRefusal::NotRunning => {
+                "System-wide expansion is off. Start it to insert, or use Copy."
+            }
+            ManualRefusal::Paused => "System-wide expansion is paused. Resume it to insert, or use Copy.",
+            ManualRefusal::NoTarget => {
+                "The app you came from is not known any more; open Quick Search again."
+            }
+            ManualRefusal::StaleTarget => {
+                "Quick Search was open too long; open it again from the field you want to type in."
+            }
+            ManualRefusal::OwnApp => "Typelune itself was active; use Copy instead.",
+            ManualRefusal::NoExactField => {
+                "The app you came from does not expose its focused text field, so Typelune cannot verify where text would go; use Copy instead."
+            }
+            ManualRefusal::ExcludedApp => "That app is excluded in Settings; use Copy instead.",
+            ManualRefusal::SecureInput => {
+                "Secure Keyboard Entry is active (often a password field); nothing is typed."
+            }
+        }
+    }
+}
+
+/// Pure decision for a Quick Search insertion; the first failing condition wins.
+pub fn check_manual_insert(s: &ManualInsertState) -> Result<(), ManualRefusal> {
+    if !s.running || s.stopping {
+        return Err(ManualRefusal::NotRunning);
+    }
+    if s.paused {
+        return Err(ManualRefusal::Paused);
+    }
+    match s.held_token {
+        Some(t) if t == s.requested_token => {}
+        _ => return Err(ManualRefusal::NoTarget),
+    }
+    if s.target_age > MANUAL_TARGET_MAX_AGE {
+        return Err(ManualRefusal::StaleTarget);
+    }
+    if s.own_app {
+        return Err(ManualRefusal::OwnApp);
+    }
+    if !s.exact_field {
+        return Err(ManualRefusal::NoExactField);
+    }
+    if s.excluded {
+        return Err(ManualRefusal::ExcludedApp);
+    }
+    if s.secure_input {
+        return Err(ManualRefusal::SecureInput);
+    }
+    Ok(())
+}
+
+/// A text-entry target captured for Quick Search (no content).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CapturedTarget {
+    pub token: u64,
+    pub pid: i32,
+    pub bundle_id: Option<String>,
+    pub excluded: bool,
+    pub secure_input: bool,
+    pub own_app: bool,
+    /// A focused UI element was exposed (so the exact field can be re-checked).
+    pub has_focused_element: bool,
 }
 
 /// Snapshot of permissions as reported by the OS (read-only checks, no prompts).
@@ -220,6 +411,8 @@ pub struct NativeStats {
     /// Expansions cancelled before or during injection (focus change, typing, stop, ...).
     pub aborted: u64,
     pub last_abort: Option<String>,
+    /// Outcome of the last Quick Search insertion (label and time, or why it was cancelled).
+    pub last_quick_insert: Option<String>,
     /// Session-only diagnostic counters (no typed content). Reset on every Start.
     pub diag: NativeDiagnostics,
 }
@@ -254,6 +447,16 @@ pub struct NativeDiagnostics {
     pub matches_queued: u64,
     /// Mouse clicks that arrived while an expansion was pending (cancelled it).
     pub mouse_during_injection: u64,
+    /// Key events in excluded apps (not recorded or matched).
+    pub excluded_skips: u64,
+    /// Matching resets because typing moved to another app.
+    pub focus_change_resets: u64,
+    /// Quick Search insertions handed to the injector.
+    pub quick_inserts_queued: u64,
+    /// Key events skipped because exclusions are set and the receiving app was unknown.
+    pub unknown_target_skips: u64,
+    /// Key events while the Quick Search panel was open (never matched automatically).
+    pub inhibited_skips: u64,
     /// Non-content description of the last event that cancelled an injection
     /// (source PID / self, marker match, source state, category, ms after match).
     pub last_cancel_event: Option<String>,
@@ -318,6 +521,7 @@ mod tests {
             job_generation: 7,
             current_generation: 7,
             secure_input: false,
+            excluded: false,
             focus_matches: Some(true),
         }
     }
@@ -360,6 +564,13 @@ mod tests {
             ),
             (
                 GateSnapshot {
+                    excluded: true,
+                    ..gates()
+                },
+                AbortReason::ExcludedApp,
+            ),
+            (
+                GateSnapshot {
                     focus_matches: Some(false),
                     ..gates()
                 },
@@ -382,10 +593,220 @@ mod tests {
             paused: true,
             current_generation: 9,
             secure_input: true,
+            excluded: true,
             focus_matches: None,
             ..gates()
         };
         assert_eq!(evaluate_gates(&all_bad), Err(AbortReason::Stopped));
+        // Exclusion wins over a focus that still matches.
+        let excluded_same_focus = GateSnapshot {
+            excluded: true,
+            ..gates()
+        };
+        assert_eq!(
+            evaluate_gates(&excluded_same_focus),
+            Err(AbortReason::ExcludedApp)
+        );
+    }
+
+    #[test]
+    fn enclosing_bundles_innermost_first() {
+        assert_eq!(
+            enclosing_app_bundles("/Applications/Editor.app/Contents/MacOS/Editor"),
+            ["/Applications/Editor.app"]
+        );
+        assert_eq!(
+            enclosing_app_bundles(
+                "/Applications/Chat.app/Contents/Frameworks/Chat Helper.app/Contents/MacOS/Chat Helper"
+            ),
+            [
+                "/Applications/Chat.app/Contents/Frameworks/Chat Helper.app",
+                "/Applications/Chat.app"
+            ]
+        );
+        assert!(enclosing_app_bundles("/usr/bin/ssh").is_empty());
+        assert!(enclosing_app_bundles("/opt/.app/x").is_empty());
+    }
+
+    #[test]
+    fn exclusion_matching_is_case_insensitive_and_covers_helpers() {
+        let set: HashSet<String> = ["com.example.chat".to_owned()].into();
+        assert!(is_excluded(
+            &set,
+            &["com.example.Chat.helper".into(), "com.example.Chat".into()]
+        ));
+        assert!(!is_excluded(&set, &["com.example.chatter".into()]));
+        assert!(!is_excluded(&HashSet::new(), &["com.example.chat".into()]));
+        assert!(!is_excluded(&set, &[]), "unknown bundle is not excluded");
+    }
+
+    #[test]
+    fn quick_search_typing_never_feeds_the_automatic_matcher() {
+        // While the panel is open, the frontmost app is still the origin app (the panel does
+        // not activate Typelune), so search keys look like typing into that app. Inhibition
+        // must win regardless of the attribution.
+        let typing_in_panel = KeyContext {
+            inhibited: true,
+            key_pid: 4242,
+            ..KeyContext::default()
+        };
+        assert_eq!(auto_skip(&typing_in_panel), Some(AutoSkip::Inhibited));
+        let unknown_pid = KeyContext {
+            inhibited: true,
+            key_pid: 0,
+            exclusions_set: true,
+            ..KeyContext::default()
+        };
+        assert_eq!(auto_skip(&unknown_pid), Some(AutoSkip::Inhibited));
+        // And the engine really expands nothing for skipped keys: feed only allowed keys.
+        let mut engine = crate::engine::Engine::new(&crate::model::Library::demo());
+        let mut expansions = 0;
+        for c in "hlo ".chars() {
+            if auto_skip(&typing_in_panel).is_none() && engine.feed(KeyInput::Char(c)).is_some() {
+                expansions += 1;
+            }
+        }
+        assert_eq!(expansions, 0);
+        // Released inhibition: ordinary typing in the origin app is matched again.
+        let after = KeyContext {
+            key_pid: 4242,
+            ..KeyContext::default()
+        };
+        assert_eq!(auto_skip(&after), None);
+        assert!("hlo "
+            .chars()
+            .any(|c| engine.feed(KeyInput::Char(c)).is_some()));
+    }
+
+    #[test]
+    fn automatic_skip_order() {
+        let all = KeyContext {
+            paused: true,
+            inhibited: true,
+            secure_input: true,
+            own_app: true,
+            key_pid: 0,
+            exclusions_set: true,
+            excluded: true,
+        };
+        assert_eq!(auto_skip(&all), Some(AutoSkip::Paused));
+        let unknown = KeyContext {
+            key_pid: 0,
+            exclusions_set: true,
+            ..KeyContext::default()
+        };
+        assert_eq!(auto_skip(&unknown), Some(AutoSkip::UnknownTarget));
+        let unknown_no_exclusions = KeyContext::default();
+        assert_eq!(auto_skip(&unknown_no_exclusions), None);
+        let excluded = KeyContext {
+            key_pid: 7,
+            excluded: true,
+            exclusions_set: true,
+            ..KeyContext::default()
+        };
+        assert_eq!(auto_skip(&excluded), Some(AutoSkip::ExcludedApp));
+    }
+
+    fn manual() -> ManualInsertState {
+        ManualInsertState {
+            running: true,
+            stopping: false,
+            paused: false,
+            held_token: Some(3),
+            requested_token: 3,
+            target_age: Duration::from_secs(5),
+            excluded: false,
+            secure_input: false,
+            own_app: false,
+            exact_field: true,
+        }
+    }
+
+    #[test]
+    fn manual_insert_requires_running_fresh_matching_target() {
+        assert_eq!(check_manual_insert(&manual()), Ok(()));
+        let cases = [
+            (
+                ManualInsertState {
+                    running: false,
+                    ..manual()
+                },
+                ManualRefusal::NotRunning,
+            ),
+            (
+                ManualInsertState {
+                    stopping: true,
+                    ..manual()
+                },
+                ManualRefusal::NotRunning,
+            ),
+            (
+                ManualInsertState {
+                    paused: true,
+                    ..manual()
+                },
+                ManualRefusal::Paused,
+            ),
+            (
+                ManualInsertState {
+                    held_token: None,
+                    ..manual()
+                },
+                ManualRefusal::NoTarget,
+            ),
+            (
+                ManualInsertState {
+                    requested_token: 2,
+                    ..manual()
+                },
+                ManualRefusal::NoTarget,
+            ),
+            (
+                ManualInsertState {
+                    target_age: MANUAL_TARGET_MAX_AGE + Duration::from_secs(1),
+                    ..manual()
+                },
+                ManualRefusal::StaleTarget,
+            ),
+            (
+                ManualInsertState {
+                    own_app: true,
+                    ..manual()
+                },
+                ManualRefusal::OwnApp,
+            ),
+            (
+                ManualInsertState {
+                    exact_field: false,
+                    ..manual()
+                },
+                ManualRefusal::NoExactField,
+            ),
+            (
+                ManualInsertState {
+                    excluded: true,
+                    ..manual()
+                },
+                ManualRefusal::ExcludedApp,
+            ),
+            (
+                ManualInsertState {
+                    secure_input: true,
+                    ..manual()
+                },
+                ManualRefusal::SecureInput,
+            ),
+        ];
+        for (state, want) in cases {
+            assert_eq!(check_manual_insert(&state), Err(want), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn manual_plan_never_erases_text() {
+        // A Quick Search insertion has nothing typed to remove: no Backspace step at all.
+        let steps = plan_injection(&rep("", "Hello,\nWorld", ""));
+        assert!(!steps.iter().any(|s| matches!(s, InjectStep::Backspaces(_))));
     }
 
     #[test]

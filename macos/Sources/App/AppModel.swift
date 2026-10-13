@@ -5,6 +5,7 @@
 
 import AppKit
 import Observation
+import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -27,6 +28,8 @@ struct PendingImport: Identifiable {
     let fileName: String
     let library: Library
     let summary: MergeSummary
+    /// Present for CSV imports: rows skipped, warnings and ignored columns.
+    var report: CsvReport? = nil
 }
 
 struct PlaygroundLogEntry: Identifiable, Equatable {
@@ -41,7 +44,7 @@ struct PlaygroundLogEntry: Identifiable, Equatable {
 final class AppModel {
     static let live = AppModel()
 
-    @ObservationIgnored private let core: TypeluneCore?
+    @ObservationIgnored let core: TypeluneCore?
     @ObservationIgnored private var commitTask: Task<Void, Never>?
     @ObservationIgnored private var lastCommitted: Library?
     @ObservationIgnored weak var undoManager: UndoManager?
@@ -56,7 +59,7 @@ final class AppModel {
     private(set) var libraryPath = ""
     private(set) var loadInfo: LoadInfo?
     private(set) var coreVersion = ""
-    private(set) var native: NativeStatus?
+    var native: NativeStatus?
     /// A native command is running off the main actor (Stop joins threads, bounded by 2 s).
     /// While set, status polling is skipped and other native commands are disabled.
     private(set) var nativeBusy = false
@@ -76,6 +79,22 @@ final class AppModel {
     var statusMessage: String?
     var showImporter = false
     var pendingImport: PendingImport?
+
+    // Background features (see AppModel+Background.swift).
+    var preferences: PreferencesReply?
+    var hotkeyStatus: HotKeyCenter.Status = .none
+    var loginItemStatus: SMAppService.Status = .notRegistered
+    var loginItemError: String?
+    var launchNotice: String?
+    var backupList: BackupList?
+    var backupError: String?
+    /// Outcome of the last Quick Search insert or copy.
+    var quickSearchNotice: String?
+    let quickSearch = QuickSearchSession()
+    @ObservationIgnored let hotKeys = HotKeyCenter()
+    @ObservationIgnored let quickSearchController = QuickSearchController()
+    @ObservationIgnored var statusTask: Task<Void, Never>?
+    @ObservationIgnored var workspaceObserver: NSObjectProtocol?
 
     @ObservationIgnored private var index: [String: (group: Int, snippet: Int)] = [:]
 
@@ -234,15 +253,21 @@ final class AppModel {
         }
     }
 
-    private func registerUndo(_ actionName: String, restoring snapshot: Library) {
-        guard let undoManager else { return }
+    /// Register Undo (and, when undone, Redo) on `manager`, or on the library window's
+    /// manager by default. Windows such as Backups pass their own, so ⌘Z works there even
+    /// when the library window is closed.
+    private func registerUndo(_ actionName: String, restoring snapshot: Library, on manager: UndoManager? = nil) {
+        guard let undoManager = manager ?? undoManager else { return }
         undoManager.registerUndo(withTarget: self) { model in
             MainActor.assumeIsolated {
                 let current = model.library
+                let undoing = undoManager.isUndoing
                 model.library = snapshot
                 if model.commitNow() {
-                    model.registerUndo(actionName, restoring: current)
+                    model.registerUndo(actionName, restoring: current, on: undoManager)
                     model.ensureSelectionVisible()
+                    // Replace any success banner from the original action, which is now stale.
+                    model.statusMessage = "\(undoing ? "Undid" : "Redid") \(actionName)."
                 }
             }
         }
@@ -381,6 +406,23 @@ final class AppModel {
         guard let core else { return }
         let scoped = url.startAccessingSecurityScopedResource()
         let path = url.path
+        if url.pathExtension.lowercased() == "csv" {
+            Task {
+                let result = await Task.detached { Result { try core.parseCsvImport(path: path) } }.value
+                if scoped { url.stopAccessingSecurityScopedResource() }
+                switch result {
+                case .success(var parsed):
+                    // CSV carries no settings: keep the current ones, even on Replace.
+                    parsed.library.settings = library.settings
+                    pendingImport = PendingImport(
+                        fileName: url.lastPathComponent, library: parsed.library, summary: parsed.summary,
+                        report: parsed.report)
+                case .failure(let error):
+                    errorMessage = "CSV import failed: \(error.localizedDescription)"
+                }
+            }
+            return
+        }
         Task {
             // Parsing (up to 10 MB) runs off the main actor; the core does not lock for it.
             let result = await Task.detached { Result { try core.parseImport(path: path) } }.value
@@ -418,6 +460,29 @@ final class AppModel {
             errorMessage = "Import failed: \(error.localizedDescription)"
         }
         pendingImport = nil
+    }
+
+    /// Restore a snapshot. Rust first saves the current library as a "before restore"
+    /// snapshot; Undo puts the current library back as well.
+    func restoreBackup(_ name: String, undoManager windowUndo: UndoManager?) {
+        guard commitNow(), let core else { return }
+        let before = library
+        do {
+            let result = try core.restoreBackup(name)
+            library = result.library
+            lastCommitted = result.library
+            activeRules = result.activeRules
+            saveStatus = result.save
+            applyLints(result.lints)
+            registerUndo("Restore Backup", restoring: before, on: windowUndo)
+            sidebarSelection = .all
+            ensureSelectionVisible()
+            statusMessage =
+                "Library restored. The previous version was kept as \(result.preRestore); Edit › Undo in the Backups window also restores it."
+            refreshBackups()
+        } catch {
+            backupError = "Restore failed; your library was not changed. \(error.localizedDescription)"
+        }
     }
 
     func exportLibrary() {

@@ -150,6 +150,39 @@ final class TypeluneCore: @unchecked Sendable {
         _ = try call(Command(cmd: "open_accessibility_settings"), as: Empty.self)
     }
 
+    private struct PreferencesCommand: Encodable { let cmd = "preferences_set"; let preferences: Preferences }
+    private struct NameCommand: Encodable { let cmd: String; let name: String }
+    private struct PidCommand: Encodable { let cmd = "native_set_frontmost"; let pid: Int32 }
+    private struct QuickInsertCommand: Encodable {
+        let cmd = "native_quick_insert"
+        let token: UInt64
+        let snippetId: String
+    }
+
+    func preferences() throws -> PreferencesReply { try call(Command(cmd: "preferences_get")) }
+    func setPreferences(_ preferences: Preferences) throws -> PreferencesReply {
+        try call(PreferencesCommand(preferences: preferences))
+    }
+    func backups() throws -> BackupList { try call(Command(cmd: "backup_list")) }
+    func backupNow() throws -> BackupList { try call(Command(cmd: "backup_now")) }
+    func readBackup(_ name: String) throws -> ParsedImport { try call(NameCommand(cmd: "backup_read", name: name)) }
+    func restoreBackup(_ name: String) throws -> BackupRestoreResult {
+        try call(NameCommand(cmd: "backup_restore", name: name))
+    }
+    func parseCsvImport(path: String) throws -> ParsedCsvImport {
+        try call(PathCommand(cmd: "parse_csv_import", path: path))
+    }
+    func setFrontmost(pid: Int32) throws { _ = try call(PidCommand(pid: pid), as: Empty.self) }
+    func captureTarget() throws -> CapturedTarget { try call(Command(cmd: "native_capture_target")) }
+    func releaseTarget() throws { _ = try call(Command(cmd: "native_release_target"), as: Empty.self) }
+    private struct InhibitCommand: Encodable { let cmd = "native_inhibit"; let on: Bool }
+    /// Suspend automatic matching while Quick Search is open (run state is unchanged).
+    @discardableResult
+    func setInhibited(_ on: Bool) throws -> NativeStatus { try call(InhibitCommand(on: on)) }
+    func quickInsert(token: UInt64, snippetID: String) throws -> NativeStatus {
+        try call(QuickInsertCommand(token: token, snippetId: snippetID))
+    }
+
     enum NativeCommand: String {
         case status = "native_status"
         case start = "native_start"

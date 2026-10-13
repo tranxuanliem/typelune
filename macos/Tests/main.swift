@@ -268,5 +268,214 @@ test("selection reconciles to a visible match or nothing") {
     check(SelectionRules.reconcile(nil, visible: ["b"]) == "b", "nothing selected picks first match")
 }
 
+test("preferences are isolated in the data folder, safe by default, and round-trip") {
+    let dir = tempDir()
+    let core = try TypeluneCore(dataDirectory: dir)
+    defer { core.close() }
+    let reply = try core.preferences()
+    check(reply.isolated, "an explicit data folder is isolated (no login items)")
+    check(!reply.preferences.startExpansionAtLaunch, "auto-start is off by default")
+    check(reply.preferences.excludedApps.isEmpty, "no exclusions by default")
+    check(
+        !FileManager.default.fileExists(atPath: dir.appendingPathComponent("preferences.json").path),
+        "reading preferences writes nothing")
+    var prefs = reply.preferences
+    prefs.quickSearchHotkey = nil
+    prefs.excludedApps = [ExcludedApp(bundleId: "com.example.Editor", name: "Editor")]
+    _ = try core.setPreferences(prefs)
+    let reopened = try TypeluneCore(dataDirectory: dir)
+    defer { reopened.close() }
+    let again = try reopened.preferences().preferences
+    check(again.quickSearchHotkey == nil, "a cleared shortcut stays cleared (encoded as null)")
+    check(again.excludedApps.map(\.bundleId) == ["com.example.Editor"], "exclusions persisted")
+}
+
+test("v0.3 libraries open unchanged; preferences never touch library.json") {
+    let dir = tempDir()
+    try TypeluneCore(dataDirectory: dir).close()  // creates a v1 library like v0.3 did
+    let file = dir.appendingPathComponent("library.json")
+    let before = try Data(contentsOf: file)
+    let core = try TypeluneCore(dataDirectory: dir)
+    var prefs = try core.preferences().preferences
+    prefs.startExpansionAtLaunch = true
+    _ = try core.setPreferences(prefs)
+    _ = try core.backups()
+    core.close()
+    check(try Data(contentsOf: file) == before, "library bytes unchanged")
+    check(
+        String(decoding: before, as: UTF8.self).contains("\"atext-rs.library\""),
+        "schema literal unchanged (v1)")
+}
+
+test("backup now, preview and restore keep the current library first") {
+    let dir = tempDir()
+    let core = try TypeluneCore(dataDirectory: dir)
+    defer { core.close() }
+    let original = try core.state().library
+    let made = try core.backupNow()
+    guard let name = made.created else {
+        check(false, "backup created")
+        return
+    }
+    check(made.backups.count == 1 && made.retention == 30, "listed with retention 30")
+    var edited = original
+    edited.groups[0].name = "Edited"
+    _ = try core.update(edited)
+    check(try core.readBackup(name).library == original, "preview shows the snapshot")
+    let restored = try core.restoreBackup(name)
+    check(restored.library == original, "restored")
+    check(try core.readBackup(restored.preRestore).library.groups[0].name == "Edited", "pre-restore kept")
+    do {
+        _ = try core.restoreBackup("../library.json")
+        check(false, "path names are refused")
+    } catch {
+        check(try core.state().library == original, "failed restore changes nothing")
+    }
+}
+
+test("CSV preview reports rows and never changes the library") {
+    let dir = tempDir()
+    let core = try TypeluneCore(dataDirectory: dir)
+    defer { core.close() }
+    let before = try core.state().library
+    let csv = dir.appendingPathComponent("in.csv")
+    try Data("\u{FEFF}abbreviation,body,group\r\nzz1,\"a, \"\"b\"\"\",G\r\n,empty,G\r\nzz1,dup,G\r\n".utf8).write(
+        to: csv)
+    let parsed = try core.parseCsvImport(path: csv.path)
+    check(parsed.report.imported == 1 && parsed.report.skippedCount == 2, "one imported, two skipped")
+    check(parsed.library.groups.first?.snippets.first?.body == "a, \"b\"", "quoted comma and quotes")
+    check(parsed.report.skipped.map(\.line) == [3, 4], "skipped lines reported")
+    check(try core.state().library == before, "library unchanged until confirmed")
+    let empty = dir.appendingPathComponent("empty.csv")
+    try Data("abbreviation,body\n".utf8).write(to: empty)
+    check(try core.parseCsvImport(path: empty.path).report.imported == 0, "header-only file imports nothing")
+}
+
+test("quick search ranks matches and moves the selection") {
+    let core = try TypeluneCore(dataDirectory: tempDir())
+    defer { core.close() }
+    let lib = try core.state().library
+    let byAbbr = QuickSearch.results(in: lib, query: "sig")
+    check(byAbbr.first?.abbreviation == "sig", "exact abbreviation first")
+    check(QuickSearch.results(in: lib, query: "SIGN-OFF").first?.title == "Sign-off", "title, case-insensitive")
+    check(QuickSearch.results(in: lib, query: "greeting").contains { $0.abbreviation == "hlo" }, "tags searched")
+    check(QuickSearch.results(in: lib, query: "Alex Example").contains { $0.abbreviation == "sig" }, "body searched")
+    check(QuickSearch.results(in: lib, query: "zzzz-none").isEmpty, "no match")
+    check(QuickSearch.results(in: lib, query: "", limit: 3).count == 3, "limit")
+    let archived = QuickSearch.results(in: lib, query: "hlo2")
+    check(archived.first?.active == false, "disabled snippets are listed and marked")
+    let ids = ["a", "b", "c"]
+    check(QuickSearch.move(nil, by: 1, in: ids) == "a", "down from nothing selects first")
+    check(QuickSearch.move(nil, by: -1, in: ids) == "c", "up from nothing selects last")
+    check(QuickSearch.move("c", by: 1, in: ids) == "c", "clamped at end")
+    check(QuickSearch.move("a", by: -1, in: ids) == "a", "clamped at start")
+    check(QuickSearch.move("b", by: 1, in: []) == nil, "empty list")
+}
+
+test("insert is offered only for a running, verified, allowed target; copy always works") {
+    let ok = CapturedTarget(
+        token: 1, pid: 42, bundleId: "com.example.Editor", excluded: false, secureInput: false, ownApp: false,
+        hasFocusedElement: true)
+    check(InsertAvailability.evaluate(native: .running, target: ok, captureError: nil) == .insert, "allowed")
+    func copyOnly(_ state: NativeRunState?, _ t: CapturedTarget?) -> Bool {
+        !InsertAvailability.evaluate(native: state, target: t, captureError: "x").canInsert
+    }
+    check(copyOnly(.off, ok), "off")
+    check(copyOnly(.paused, ok), "paused")
+    check(copyOnly(.stopping, ok), "stopping")
+    check(copyOnly(nil, ok), "unknown state")
+    check(copyOnly(.running, nil), "no target (e.g. no Accessibility)")
+    var t = ok
+    t.hasFocusedElement = false
+    check(copyOnly(.running, t), "field not identified exactly")
+    t = ok
+    t.excluded = true
+    check(copyOnly(.running, t), "excluded app")
+    t = ok
+    t.secureInput = true
+    check(copyOnly(.running, t), "secure input")
+    t = ok
+    t.ownApp = true
+    check(copyOnly(.running, t), "Typelune itself")
+    check(
+        !InsertAvailability.evaluate(native: .running, target: ok, captureError: nil, editsCommitted: false).canInsert,
+        "pending edits that could not be committed block Insert")
+}
+
+test("Rust refuses quick insertion when off and keeps the run state while inhibited") {
+    let core = try TypeluneCore(dataDirectory: tempDir())
+    defer { core.close() }
+    let id = try core.state().library.groups[0].snippets[0].id
+    do {
+        _ = try core.quickInsert(token: 1, snippetID: id)
+        check(false, "must be refused while expansion is off")
+    } catch {
+        check(error.localizedDescription.contains("off"), "honest reason")
+    }
+    let on = try core.setInhibited(true)
+    check(on.inhibited && on.state == .off, "inhibited without starting anything")
+    check(try !core.setInhibited(false).inhibited, "released")
+    check(try core.native(.status).stats.diag.quickInsertsQueued == 0, "nothing queued")
+}
+
+test("quick search focus: restore only after explicit dismissal, never over another app") {
+    func restore(_ r: QuickSearchDismissal, front: Bool = true, running: Bool = true, own: Bool = false) -> Bool {
+        QuickSearchFocusPolicy.restoreOrigin(
+            after: r, typeluneFrontmost: front, originRunning: running, originIsTypelune: own)
+    }
+    for r in [QuickSearchDismissal.escape, .closeButton, .shortcut, .copy, .insert] {
+        check(restore(r), "explicit dismissal returns focus: \(r)")
+        check(!restore(r, front: false), "never over an app the user switched to: \(r)")
+        check(!restore(r, running: false), "origin quit: \(r)")
+        check(!restore(r, own: true), "origin was Typelune itself: \(r)")
+    }
+    check(!restore(.clickAway), "clicking elsewhere keeps the user's choice")
+    check(
+        !QuickSearchFocusPolicy.resignKeyCancels(panelVisible: true, closingOnPurpose: false, activationPending: true),
+        "activation still settling: losing key status is not a cancel")
+    check(
+        QuickSearchFocusPolicy.resignKeyCancels(panelVisible: true, closingOnPurpose: false, activationPending: false),
+        "after activation, losing key status is a click-away")
+    check(
+        !QuickSearchFocusPolicy.resignKeyCancels(panelVisible: true, closingOnPurpose: true, activationPending: false),
+        "hiding on purpose is not a click-away")
+    check(
+        !QuickSearchFocusPolicy.resignKeyCancels(
+            panelVisible: false, closingOnPurpose: false, activationPending: false),
+        "hidden panel")
+    check(
+        QuickSearchFocusPolicy.otherAppActivationCancels(
+            panelVisible: true, closingOnPurpose: false, activatedIsTypelune: false),
+        "another app activated while open: click-away")
+    check(
+        !QuickSearchFocusPolicy.otherAppActivationCancels(
+            panelVisible: true, closingOnPurpose: false, activatedIsTypelune: true),
+        "Typelune's own activation is expected")
+    check(
+        !QuickSearchFocusPolicy.otherAppActivationCancels(
+            panelVisible: false, closingOnPurpose: true, activatedIsTypelune: false),
+        "returning focus to the origin after Copy/Insert is not a click-away")
+}
+
+test("shortcut, auto-start and login-item rules") {
+    let def = Hotkey(keyCode: 17, command: true, option: true, control: true, shift: false, keyLabel: "T")
+    check(HotkeyRules.problem(def) == nil, "default is valid")
+    check(HotkeyRules.display(def) == "⌃⌥⌘T", "display order")
+    var h = def
+    h.command = false
+    h.option = false
+    h.control = false
+    check(HotkeyRules.problem(h) != nil, "needs a modifier")
+    h = Hotkey(keyCode: 17, command: true, option: false, control: false, shift: false, keyLabel: "T")
+    check(HotkeyRules.problem(h) != nil, "plain ⌘-key is refused")
+    h = Hotkey(keyCode: 49, command: false, option: true, control: false, shift: false, keyLabel: "Space")
+    check(HotkeyRules.problem(h) != nil, "⌥Space alone is refused")
+    check(!LaunchPolicy.shouldAutoStart(optedIn: false, accessibilityGranted: true), "no opt-in, no start")
+    check(!LaunchPolicy.shouldAutoStart(optedIn: true, accessibilityGranted: false), "never without permission")
+    check(LaunchPolicy.shouldAutoStart(optedIn: true, accessibilityGranted: true), "opt-in and permission")
+    check(!LaunchPolicy.loginItemsAllowed(isolated: true), "isolated runs never register login items")
+    check(LaunchPolicy.loginItemsAllowed(isolated: false), "default folder may")
+}
+
 print("\(passes) checks passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

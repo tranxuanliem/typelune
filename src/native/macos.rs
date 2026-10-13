@@ -19,18 +19,29 @@
 //!   when the match is queued, and must be unchanged immediately before injection and
 //!   before every injection step. If the focused app cannot be identified, nothing is
 //!   injected. The key event's target PID (when macOS provides it) must equal the focused app.
-//! * Gates (stop/pause/generation/secure input) are re-checked before every synthetic key.
+//! * Gates (stop/pause/generation/secure input/exclusion) are re-checked before every
+//!   synthetic key.
+//!
+//! App exclusions (by bundle identifier) apply twice: key events whose target app is
+//! excluded are neither recorded nor matched, and injection is refused if the focused app is
+//! excluded. Switching apps resets matching.
+//!
+//! Quick Search insertion (manual) reuses the same injector: the focused app and element are
+//! captured *before* the panel opens; after it closes, the injector waits (bounded) for that
+//! exact target to be focused again and then applies the same gates. Nothing typed is erased.
 
 use super::{
-    classify_key, evaluate_gates, key_category, plan_injection, AbortReason, GateSnapshot,
-    InjectStep, KeyCategory, KeyInput, NativeDiagnostics, NativeState, NativeStats, Permissions,
-    SYNTHETIC_MARKER,
+    auto_skip, check_manual_insert, classify_key, enclosing_app_bundles, evaluate_gates,
+    is_excluded, key_category, plan_injection, AbortReason, AutoSkip, CapturedTarget, GateSnapshot,
+    InjectStep, KeyCategory, KeyContext, KeyInput, ManualInsertState, NativeDiagnostics,
+    NativeState, NativeStats, Permissions, SYNTHETIC_MARKER,
 };
 use crate::engine::{Engine, Expansion};
-use crate::model::Library;
+use crate::model::{Library, Snippet};
 use crate::template::{uses_clipboard, RenderContext};
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -71,7 +82,27 @@ extern "C" {
         encoding: u32,
         is_external: u8,
     ) -> CFStringRef;
+    fn CFStringGetCString(s: CFStringRef, buf: *mut u8, size: isize, encoding: u32) -> u8;
+    fn CFURLCreateFromFileSystemRepresentation(
+        alloc: CFTypeRef,
+        buf: *const u8,
+        len: isize,
+        is_directory: u8,
+    ) -> CFTypeRef;
+    fn CFBundleCreate(alloc: CFTypeRef, url: CFTypeRef) -> CFTypeRef;
+    fn CFBundleGetIdentifier(bundle: CFTypeRef) -> CFStringRef;
 }
+
+extern "C" {
+    /// libproc (part of libSystem): executable path of a process.
+    fn proc_pidpath(pid: i32, buffer: *mut c_void, size: u32) -> i32;
+}
+
+const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
+/// Bounded cache of PID → (executable path, enclosing bundle identifiers).
+const BUNDLE_CACHE_CAPACITY: usize = 128;
+/// How long a Quick Search insertion waits for its original target to be focused again.
+const MANUAL_REFOCUS_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -179,6 +210,8 @@ const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 /// Upper bound when reading a key event's Unicode string.
 const MAX_EVENT_UTF16: usize = 64;
 const SETTLE_DELAY: Duration = Duration::from_millis(30);
+/// Extra settle time after the Quick Search panel closed and the target is focused again.
+const MANUAL_SETTLE_DELAY: Duration = Duration::from_millis(80);
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 /// Explicit bound on queued injection jobs.
 const INJECT_QUEUE_CAPACITY: usize = 1;
@@ -314,6 +347,88 @@ pub fn translate_keycode(layout: &LayoutSnapshot, keycode: u16, flags: u64) -> S
     String::from_utf16_lossy(&buf[..len.min(buf.len())])
 }
 
+// ---- Bundle identifiers of processes ---------------------------------------------------
+
+fn executable_path(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: buffer is valid for `len` bytes; returns the number of bytes written.
+    let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    String::from_utf8(buf).ok()
+}
+
+/// `CFBundleIdentifier` of the bundle at `path`, read through CoreFoundation.
+fn bundle_identifier(path: &str) -> Option<String> {
+    // SAFETY: CF objects created here are released; the identifier follows the Get rule
+    // (owned by the bundle) and is copied before the bundle is released.
+    unsafe {
+        let url = CFURLCreateFromFileSystemRepresentation(
+            std::ptr::null(),
+            path.as_ptr(),
+            path.len() as isize,
+            1,
+        );
+        if url.is_null() {
+            return None;
+        }
+        let bundle = CFBundleCreate(std::ptr::null(), url);
+        CFRelease(url);
+        if bundle.is_null() {
+            return None;
+        }
+        let id = CFBundleGetIdentifier(bundle);
+        let mut out = None;
+        if !id.is_null() {
+            let mut buf = [0u8; 512];
+            if CFStringGetCString(
+                id,
+                buf.as_mut_ptr(),
+                buf.len() as isize,
+                CF_STRING_ENCODING_UTF8,
+            ) != 0
+            {
+                let len = buf.iter().position(|b| *b == 0).unwrap_or(0);
+                out = String::from_utf8(buf[..len].to_vec()).ok();
+            }
+        }
+        CFRelease(bundle);
+        out.filter(|s| !s.is_empty())
+    }
+}
+
+/// Bundle identifiers of the `.app` bundles containing a process's executable, innermost
+/// first. Cached per PID; the executable path is re-read every time so a reused PID is
+/// never confused with the earlier process.
+fn bundle_ids_for_pid(cache: &Mutex<HashMap<i32, (String, Vec<String>)>>, pid: i32) -> Vec<String> {
+    let Some(path) = executable_path(pid) else {
+        return Vec::new();
+    };
+    if let Ok(c) = cache.lock() {
+        if let Some((p, ids)) = c.get(&pid) {
+            if *p == path {
+                return ids.clone();
+            }
+        }
+    }
+    let ids: Vec<String> = enclosing_app_bundles(&path)
+        .iter()
+        .filter_map(|b| bundle_identifier(b))
+        .collect();
+    if let Ok(mut c) = cache.lock() {
+        if c.len() >= BUNDLE_CACHE_CAPACITY {
+            c.clear();
+        }
+        c.insert(pid, (path, ids.clone()));
+    }
+    ids
+}
+
 // ---- Focus identity via Accessibility -------------------------------------------------
 
 /// Focused application PID plus (when exposed) the focused UI element.
@@ -322,6 +437,11 @@ struct FocusIdentity {
     /// Retained AXUIElementRef or null if the app does not expose a focused element.
     element: CFTypeRef,
 }
+
+// SAFETY: the element is a retained AXUIElementRef (a CFType). CF retain/release are
+// thread-safe and the AX API may be called from any thread; the identity is only moved
+// between threads, never used concurrently.
+unsafe impl Send for FocusIdentity {}
 
 impl FocusIdentity {
     fn capture() -> Option<Self> {
@@ -413,9 +533,40 @@ struct Shared {
     layout: Mutex<Option<Arc<LayoutSnapshot>>>,
     /// When the pending match was queued (for cancellation timing diagnostics only).
     queued_at: Mutex<Option<Instant>>,
+    /// Excluded bundle identifiers, lower-case.
+    excluded: Mutex<HashSet<String>>,
+    bundles: Mutex<HashMap<i32, (String, Vec<String>)>>,
+    /// Frontmost app as reported by the UI (NSWorkspace), used when a key event carries no
+    /// target PID. 0 = unknown.
+    frontmost_pid: AtomicI32,
+    /// App that received the previous key event (0 = none); a change resets matching.
+    last_key_pid: AtomicI32,
+    /// Target captured for Quick Search before its panel took keyboard focus.
+    manual_target: Mutex<Option<ManualTarget>>,
+    /// The Quick Search panel is open: automatic matching is suspended.
+    inhibited: AtomicBool,
+    next_token: AtomicU64,
+}
+
+struct ManualTarget {
+    token: u64,
+    focus: FocusIdentity,
+    captured_at: Instant,
 }
 
 impl Shared {
+    fn is_excluded_pid(&self, pid: i32) -> bool {
+        let empty = self.excluded.lock().map(|e| e.is_empty()).unwrap_or(true);
+        if empty || pid <= 0 {
+            return false;
+        }
+        let ids = bundle_ids_for_pid(&self.bundles, pid);
+        self.excluded
+            .lock()
+            .map(|e| is_excluded(&e, &ids))
+            .unwrap_or(false)
+    }
+
     fn cancel_pending(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
@@ -426,13 +577,19 @@ impl Shared {
         }
     }
 
-    fn gates(&self, job_generation: u64, focus_matches: Option<bool>) -> GateSnapshot {
+    fn gates(
+        &self,
+        job_generation: u64,
+        target_pid: i32,
+        focus_matches: Option<bool>,
+    ) -> GateSnapshot {
         GateSnapshot {
             shutdown: self.shutdown.load(Ordering::SeqCst),
             paused: self.paused.load(Ordering::SeqCst),
             job_generation,
             current_generation: self.generation.load(Ordering::SeqCst),
             secure_input: secure_input_active(),
+            excluded: self.is_excluded_pid(target_pid),
             focus_matches,
         }
     }
@@ -443,6 +600,9 @@ struct Job {
     generation: u64,
     /// Target PID of the triggering key event, if macOS supplied one.
     target_pid: Option<i32>,
+    /// Quick Search: the target captured before the panel opened. Injection waits for it to
+    /// be focused again and never deletes anything.
+    manual_origin: Option<FocusIdentity>,
 }
 
 struct TapContext {
@@ -460,6 +620,8 @@ struct Threads {
 pub struct NativeController {
     shared: Arc<Shared>,
     running: Option<Threads>,
+    /// Sender used for Quick Search insertions (the tap thread owns its own clone).
+    injector_tx: Option<SyncSender<Job>>,
     /// Threads that did not finish after a failed start; joined before the next start.
     orphans: Option<Threads>,
     /// A stop was begun (`begin_stop`) but not finished yet.
@@ -488,8 +650,16 @@ impl NativeController {
                 layout: Mutex::new(None),
                 queued_at: Mutex::new(None),
                 run_loop: AtomicUsize::new(0),
+                excluded: Mutex::new(HashSet::new()),
+                bundles: Mutex::new(HashMap::new()),
+                frontmost_pid: AtomicI32::new(0),
+                last_key_pid: AtomicI32::new(0),
+                manual_target: Mutex::new(None),
+                inhibited: AtomicBool::new(false),
+                next_token: AtomicU64::new(1),
             }),
             running: None,
+            injector_tx: None,
             orphans: None,
             stopping: false,
             last_error: None,
@@ -555,6 +725,140 @@ impl NativeController {
         self.shared.reset_engine();
     }
 
+    /// Replace the excluded bundle identifiers (lower-cased). Cancels anything pending.
+    pub fn set_exclusions(&self, excluded: HashSet<String>) {
+        if let Ok(mut e) = self.shared.excluded.lock() {
+            *e = excluded;
+        }
+        self.shared.cancel_pending();
+        self.shared.reset_engine();
+    }
+
+    /// The frontmost app changed (reported by the UI). Typed context is gone, so matching
+    /// resets. A pending injection is not cancelled here: the injector re-checks the focused
+    /// app and field before every key, and a Quick Search insertion legitimately waits for
+    /// its original app to become frontmost again.
+    pub fn set_frontmost(&self, pid: i32) {
+        let previous = self.shared.frontmost_pid.swap(pid.max(0), Ordering::SeqCst);
+        if previous != pid {
+            self.shared.reset_engine();
+        }
+    }
+
+    /// Capture the focused app and text element for Quick Search, before its panel takes
+    /// keyboard focus. Needs Accessibility (read-only AX queries; nothing is typed). The
+    /// result says whether insertion could be allowed; Copy works regardless.
+    pub fn capture_target(&self) -> Result<CapturedTarget, String> {
+        if !permissions().accessibility {
+            return Err("Accessibility permission is not granted, so the field you came from cannot be identified. Copy still works.".into());
+        }
+        let focus = FocusIdentity::capture()
+            .ok_or("The focused app could not be identified (fail closed). Copy still works.")?;
+        let own_app = focus.pid as i64 == std::process::id() as i64;
+        let ids = bundle_ids_for_pid(&self.shared.bundles, focus.pid);
+        let target = CapturedTarget {
+            token: self.shared.next_token.fetch_add(1, Ordering::SeqCst),
+            pid: focus.pid,
+            bundle_id: ids.first().cloned(),
+            excluded: self.shared.is_excluded_pid(focus.pid),
+            secure_input: secure_input_active(),
+            own_app,
+            has_focused_element: !focus.element.is_null(),
+        };
+        if let Ok(mut m) = self.shared.manual_target.lock() {
+            *m = Some(ManualTarget {
+                token: target.token,
+                focus,
+                captured_at: Instant::now(),
+            });
+        }
+        Ok(target)
+    }
+
+    /// Suspend (or resume) automatic matching while the Quick Search panel is open. The
+    /// panel does not activate Typelune, so its search typing would otherwise look like
+    /// typing in the app underneath. Running/Paused state is not changed.
+    pub fn set_inhibited(&self, on: bool) {
+        self.shared.inhibited.store(on, Ordering::SeqCst);
+        self.shared.reset_engine();
+    }
+
+    pub fn is_inhibited(&self) -> bool {
+        self.shared.inhibited.load(Ordering::SeqCst)
+    }
+
+    /// Forget a captured target (panel closed without inserting).
+    pub fn release_target(&self) {
+        if let Ok(mut m) = self.shared.manual_target.lock() {
+            *m = None;
+        }
+    }
+
+    /// Queue a Quick Search insertion of `snippet` into the target captured with `token`.
+    /// Refused unless expansion is running (not paused/stopping) and the target is fresh,
+    /// not Typelune, not excluded and Secure Keyboard Entry is off. Nothing is erased. The
+    /// injector re-verifies everything before and during typing.
+    pub fn quick_insert(&mut self, token: u64, snippet: &Snippet) -> Result<(), String> {
+        let held = self
+            .shared
+            .manual_target
+            .lock()
+            .ok()
+            .and_then(|mut m| m.take());
+        let state = ManualInsertState {
+            running: self.running.is_some() && !self.shared.shutdown.load(Ordering::SeqCst),
+            stopping: self.stopping,
+            paused: self.shared.paused.load(Ordering::SeqCst),
+            held_token: held.as_ref().map(|t| t.token),
+            requested_token: token,
+            target_age: held
+                .as_ref()
+                .map(|t| t.captured_at.elapsed())
+                .unwrap_or_default(),
+            excluded: held
+                .as_ref()
+                .is_some_and(|t| self.shared.is_excluded_pid(t.focus.pid)),
+            secure_input: secure_input_active(),
+            own_app: held
+                .as_ref()
+                .is_some_and(|t| t.focus.pid as i64 == std::process::id() as i64),
+            exact_field: held.as_ref().is_some_and(|t| !t.focus.element.is_null()),
+        };
+        check_manual_insert(&state).map_err(|r| r.describe().to_owned())?;
+        let (Some(target), Some(tx)) = (held, self.injector_tx.as_ref()) else {
+            return Err(super::ManualRefusal::NotRunning.describe().into());
+        };
+        if self.shared.injecting.swap(true, Ordering::SeqCst) {
+            return Err("Another expansion is being typed; try again in a moment.".into());
+        }
+        let job = Job {
+            expansion: Expansion {
+                snippet_id: snippet.id,
+                title: snippet.display_name(),
+                abbreviation: String::new(),
+                typed: String::new(),
+                body: snippet.body.clone(),
+                suffix: String::new(),
+            },
+            generation: self.shared.generation.load(Ordering::SeqCst),
+            target_pid: None,
+            manual_origin: Some(target.focus),
+        };
+        if let Ok(mut q) = self.shared.queued_at.lock() {
+            *q = Some(Instant::now());
+        }
+        match tx.try_send(job) {
+            Ok(()) => {
+                bump(&self.shared, |d| d.quick_inserts_queued += 1);
+                Ok(())
+            }
+            Err(_) => {
+                self.shared.injecting.store(false, Ordering::SeqCst);
+                Err("The injector is busy or stopped; nothing was typed.".into())
+            }
+        }
+    }
+
     pub fn start(&mut self, library: &Library) -> Result<(), String> {
         if self.running.is_some() {
             return Ok(());
@@ -595,8 +899,10 @@ impl NativeController {
         self.shared.paused.store(false, Ordering::SeqCst);
         self.shared.injecting.store(false, Ordering::SeqCst);
         self.shared.shutdown.store(false, Ordering::SeqCst);
+        self.shared.last_key_pid.store(0, Ordering::SeqCst);
 
         let (tx, rx) = mpsc::sync_channel::<Job>(INJECT_QUEUE_CAPACITY);
+        let manual_tx = tx.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let shared = self.shared.clone();
         let tap = std::thread::Builder::new()
@@ -620,6 +926,7 @@ impl NativeController {
         let outcome = match ready_rx.recv_timeout(START_TIMEOUT) {
             Ok(Ok(())) => {
                 self.running = Some(threads);
+                self.injector_tx = Some(manual_tx);
                 return Ok(());
             }
             Ok(Err(msg)) => msg,
@@ -645,6 +952,8 @@ impl NativeController {
     /// loop) and hands back the threads to join. Start is refused until `finish_stop`.
     pub fn begin_stop(&mut self) -> Option<PendingStop> {
         let threads = self.running.take()?;
+        self.injector_tx = None;
+        self.release_target();
         self.signal_shutdown();
         self.stopping = true;
         self.shared.reset_engine();
@@ -969,10 +1278,6 @@ fn handle_event(ctx: &TapContext, event_type: u32, event: CGEventRef) {
         bump(shared, |d| d.own_event_skips += 1);
         return;
     }
-    if shared.paused.load(Ordering::SeqCst) {
-        bump(shared, |d| d.paused_skips += 1);
-        return;
-    }
     if shared.injecting.load(Ordering::SeqCst) {
         // Real (non-own) key while an expansion is pending/in progress: cancel it.
         shared.cancel_pending();
@@ -988,19 +1293,63 @@ fn handle_event(ctx: &TapContext, event_type: u32, event: CGEventRef) {
         });
         return;
     }
-    if secure_input_active() {
-        shared.cancel_pending();
-        shared.reset_engine();
-        if let Ok(mut s) = shared.stats.lock() {
-            s.secure_input_skips += 1;
+    // Which app receives this key: the event's target PID, else the frontmost app (as
+    // reported by the UI). 0 = unknown.
+    let key_pid = if info.target_pid > 0 {
+        info.target_pid as i32
+    } else {
+        shared.frontmost_pid.load(Ordering::SeqCst)
+    };
+    if key_pid > 0 {
+        let previous = shared.last_key_pid.swap(key_pid, Ordering::SeqCst);
+        if previous != 0 && previous != key_pid {
+            // Typing moved to another app: what was typed before is not context any more.
+            shared.cancel_pending();
+            shared.reset_engine();
+            bump(shared, |d| d.focus_change_resets += 1);
         }
-        return;
     }
-    if targets_own_process(info.target_pid, std::process::id()) {
-        // Typing into our own editor/Playground: never feed the global matcher, otherwise
-        // the in-app engine and the global injector would both expand the same text.
+    let exclusions_set = shared
+        .excluded
+        .lock()
+        .map(|e| !e.is_empty())
+        .unwrap_or(true);
+    let paused = shared.paused.load(Ordering::SeqCst);
+    let inhibited = shared.inhibited.load(Ordering::SeqCst);
+    let own_app = targets_own_process(key_pid as i64, std::process::id());
+    let context = KeyContext {
+        paused,
+        inhibited,
+        // Only queried when it can still matter (it is a cheap system call).
+        secure_input: !paused && !inhibited && secure_input_active(),
+        own_app,
+        key_pid,
+        exclusions_set,
+        excluded: !paused
+            && !inhibited
+            && !own_app
+            && key_pid > 0
+            && shared.is_excluded_pid(key_pid),
+    };
+    if let Some(skip) = auto_skip(&context) {
+        if skip != AutoSkip::Paused {
+            shared.cancel_pending();
+        }
         shared.reset_engine();
-        bump(shared, |d| d.own_app_skips += 1);
+        match skip {
+            AutoSkip::Paused => bump(shared, |d| d.paused_skips += 1),
+            AutoSkip::Inhibited => bump(shared, |d| d.inhibited_skips += 1),
+            AutoSkip::SecureInput => {
+                if let Ok(mut s) = shared.stats.lock() {
+                    s.secure_input_skips += 1;
+                }
+            }
+            // Typing into our own editor/Playground: never feed the global matcher, otherwise
+            // the in-app engine and the global injector would both expand the same text.
+            AutoSkip::OwnApp => bump(shared, |d| d.own_app_skips += 1),
+            AutoSkip::UnknownTarget => bump(shared, |d| d.unknown_target_skips += 1),
+            AutoSkip::ExcludedApp => bump(shared, |d| d.excluded_skips += 1),
+        }
         return;
     }
     let mut category = key_category(info.keycode, info.flags, &info.chars);
@@ -1038,7 +1387,9 @@ fn handle_event(ctx: &TapContext, event_type: u32, event: CGEventRef) {
             let job = Job {
                 expansion,
                 generation: shared.generation.load(Ordering::SeqCst),
-                target_pid: (info.target_pid > 0).then_some(info.target_pid as i32),
+                // Bound to the app the key was attributed to; the injector refuses any other.
+                target_pid: (key_pid > 0).then_some(key_pid),
+                manual_origin: None,
             };
             shared.injecting.store(true, Ordering::SeqCst);
             if let Ok(mut q) = shared.queued_at.lock() {
@@ -1076,17 +1427,26 @@ fn run_injector(shared: Arc<Shared>, rx: Receiver<Job>) {
             break;
         }
         let result = inject(&shared, source, &job);
+        let manual = job.manual_origin.is_some();
         if let Ok(mut s) = shared.stats.lock() {
+            let now = chrono::Local::now();
             match result {
                 Ok(warning) => {
                     s.expansions += 1;
                     s.last_snippet = Some(job.expansion.title.clone());
-                    s.last_at = Some(chrono::Local::now());
+                    s.last_at = Some(now);
                     s.last_warning = warning;
+                    if manual {
+                        s.last_quick_insert = Some(format!(
+                            "Inserted “{}” at {}",
+                            job.expansion.title,
+                            now.format("%H:%M:%S")
+                        ));
+                    }
                 }
                 Err((reason, partial, detail)) => {
                     s.aborted += 1;
-                    s.last_abort = Some(format!(
+                    let text = format!(
                         "{}{}{} at {}",
                         reason.describe(),
                         detail.map(|d| format!(" [{d}]")).unwrap_or_default(),
@@ -1095,8 +1455,12 @@ fn run_injector(shared: Arc<Shared>, rx: Receiver<Job>) {
                         } else {
                             ""
                         },
-                        chrono::Local::now().format("%H:%M:%S")
-                    ));
+                        now.format("%H:%M:%S")
+                    );
+                    if manual {
+                        s.last_quick_insert = Some(format!("Not inserted: {text}"));
+                    }
+                    s.last_abort = Some(text);
                 }
             }
         }
@@ -1119,10 +1483,36 @@ fn inject(
     source: CGEventSourceRef,
     job: &Job,
 ) -> Result<Option<String>, (AbortReason, bool, Option<String>)> {
-    let quick = || evaluate_gates(&shared.gates(job.generation, Some(true)));
+    let captured;
+    let origin: &FocusIdentity = match &job.manual_origin {
+        Some(target) => {
+            // Quick Search: the panel has closed; wait (bounded) for the exact app and field
+            // captured before it opened to be focused again. Never type anywhere else.
+            let early = |pid| evaluate_gates(&shared.gates(job.generation, pid, Some(true)));
+            let deadline = Instant::now() + MANUAL_REFOCUS_TIMEOUT;
+            loop {
+                early(target.pid).map_err(|r| (r, false, None))?;
+                if FocusIdentity::capture().is_some_and(|now| target.matches(&now)) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err((
+                        AbortReason::FocusChanged,
+                        false,
+                        Some("the original field was not focused again".into()),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            target
+        }
+        None => {
+            captured = FocusIdentity::capture().ok_or((AbortReason::FocusUnknown, false, None))?;
+            &captured
+        }
+    };
+    let quick = || evaluate_gates(&shared.gates(job.generation, origin.pid, Some(true)));
     quick().map_err(|r| (r, false, None))?;
-
-    let origin = FocusIdentity::capture().ok_or((AbortReason::FocusUnknown, false, None))?;
     if origin.pid as i64 == std::process::id() as i64 {
         // Never inject into ourselves (covers events that carried no target PID).
         return Err((AbortReason::OwnApp, false, None));
@@ -1134,14 +1524,22 @@ fn inject(
             return Err((AbortReason::TargetMismatch, false, Some(detail)));
         }
     }
+    // Every gate, including the focused app *and* field, is re-verified immediately before
+    // each synthetic key event: each Backspace, Return and Left arrow, and each text chunk
+    // (at most MAX_UTF16_PER_EVENT UTF-16 units). One event cannot be checked part-way.
     let full = || {
         let now = FocusIdentity::capture();
         let focus = now.map(|n| origin.matches(&n));
-        evaluate_gates(&shared.gates(job.generation, focus))
+        evaluate_gates(&shared.gates(job.generation, origin.pid, focus))
     };
 
-    // Let the trigger key land, watching for cancellation meanwhile.
-    let settle_until = Instant::now() + SETTLE_DELAY;
+    // Let the trigger key land (or the refocused field settle), watching for cancellation.
+    let settle = if job.manual_origin.is_some() {
+        MANUAL_SETTLE_DELAY
+    } else {
+        SETTLE_DELAY
+    };
+    let settle_until = Instant::now() + settle;
     while Instant::now() < settle_until {
         quick().map_err(|r| (r, false, None))?;
         std::thread::sleep(Duration::from_millis(5));
@@ -1171,12 +1569,8 @@ fn inject(
         unsafe { CGEventPostToPid(pid, ev) };
         std::thread::sleep(Duration::from_millis(1));
     };
-    let mut started = false;
-    for step in plan_injection(&rep) {
-        full().map_err(|r| (r, started, None))?;
-        post_step(source, &step, &quick, &mut sink).map_err(|r| (r, true, None))?;
-        started = true;
-    }
+    run_steps(source, &plan_injection(&rep), &full, &mut sink)
+        .map_err(|(r, partial)| (r, partial, None))?;
     std::thread::sleep(Duration::from_millis(20));
     Ok(rep.warnings.first().cloned())
 }
@@ -1234,6 +1628,25 @@ fn emit_key(
         // SAFETY: we own the event; sinks never retain it.
         unsafe { CFRelease(ev as CFTypeRef) };
     }
+}
+
+/// Emit all steps, checking `gate` before every key event. On failure, reports whether any
+/// event had already been delivered.
+fn run_steps(
+    source: CGEventSourceRef,
+    steps: &[InjectStep],
+    gate: &dyn Fn() -> Result<(), AbortReason>,
+    sink: &mut dyn FnMut(CGEventRef),
+) -> Result<(), (AbortReason, bool)> {
+    let emitted = std::cell::Cell::new(0usize);
+    let mut counting = |ev: CGEventRef| {
+        emitted.set(emitted.get() + 1);
+        sink(ev);
+    };
+    for step in steps {
+        post_step(source, step, gate, &mut counting).map_err(|r| (r, emitted.get() > 0))?;
+    }
+    Ok(())
 }
 
 /// Emit one injection step. `gate` is checked before every key; `sink` delivers events
@@ -1469,6 +1882,54 @@ mod tests {
             4,
             "exactly two keys (down+up) before the gate failed"
         );
+    }
+
+    #[test]
+    fn focus_flip_mid_text_stops_before_the_next_event() {
+        use std::cell::Cell;
+        // A long multi-chunk insertion; the "focused field" changes after the 3rd check.
+        let rep = crate::engine::Replacement {
+            delete_chars: 0,
+            delete_text: String::new(),
+            insert: "x".repeat(super::super::MAX_UTF16_PER_EVENT * 5),
+            after_cursor: String::new(),
+            warnings: vec![],
+        };
+        let steps = plan_injection(&rep);
+        assert_eq!(steps.len(), 5, "five text chunks");
+        let checks = Cell::new(0);
+        let gate = || {
+            checks.set(checks.get() + 1);
+            if checks.get() > 3 {
+                Err(AbortReason::FocusChanged)
+            } else {
+                Ok(())
+            }
+        };
+        let source = make_synthetic_source();
+        let mut events = 0;
+        let mut sink = |_ev: CGEventRef| events += 1;
+        let result = run_steps(source, &steps, &gate, &mut sink);
+        // SAFETY: we own the source.
+        unsafe { CFRelease(source as CFTypeRef) };
+        assert_eq!(result, Err((AbortReason::FocusChanged, true)));
+        assert_eq!(
+            events,
+            3 * 2,
+            "three chunks (down+up), nothing after the flip"
+        );
+        assert_eq!(checks.get(), 4, "checked before every chunk");
+
+        // A flip before anything was sent reports no partial injection.
+        let never = || Err(AbortReason::FocusChanged);
+        let source = make_synthetic_source();
+        let mut none = 0;
+        let mut sink = |_ev: CGEventRef| none += 1;
+        let result = run_steps(source, &steps, &never, &mut sink);
+        // SAFETY: we own the source.
+        unsafe { CFRelease(source as CFTypeRef) };
+        assert_eq!(result, Err((AbortReason::FocusChanged, false)));
+        assert_eq!(none, 0);
     }
 
     #[test]

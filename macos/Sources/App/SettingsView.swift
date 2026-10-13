@@ -3,11 +3,13 @@ import SwiftUI
 struct SettingsView: View {
     var body: some View {
         TabView {
+            Tab("General", systemImage: "gearshape") { GeneralSettings() }
             Tab("Expansion", systemImage: "text.cursor") { ExpansionSettings() }
+            Tab("Exclusions", systemImage: "nosign") { ExclusionSettings() }
             Tab("Placeholders", systemImage: "curlybraces") { PlaceholderHelp() }
             Tab("Data", systemImage: "externaldrive") { DataSettings() }
         }
-        .frame(width: 520, height: 440)
+        .frame(width: 580, height: 500)
     }
 }
 
@@ -102,6 +104,7 @@ private struct PlaceholderHelp: View {
 
 private struct DataSettings: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Form {
@@ -120,6 +123,7 @@ private struct DataSettings: View {
             HStack {
                 Button("Reveal in Finder") { model.revealLibrary() }
                 Button("Refresh") { model.refreshSaveStatus() }
+                Button("Backups…") { openWindow(id: WindowID.backups) }
             }
         }
         .formStyle(.grouped)

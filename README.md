@@ -30,11 +30,20 @@ template.
   `{{cursor}}`.
 - **Playground.** Try your snippets in a scratch area without enabling anything
   system-wide.
-- **System-wide expansion, off by default.** You turn it on yourself. It needs the
-  Accessibility permission, which you grant in System Settings. See
-  [docs/privacy.md](docs/privacy.md).
-- **Your data stays local.** One JSON file in Application Support, with import/export, and
-  merge or replace with Undo.
+- **System-wide expansion, off by default.** You turn it on yourself (or opt in to starting
+  it when Typelune opens). It needs the Accessibility permission, which you grant in System
+  Settings. See [docs/privacy.md](docs/privacy.md).
+- **Menu bar.** Typelune keeps running in the menu bar after you close its window, with
+  Start/Pause/Resume, Quick Search, Open Library and Quit. Optional launch at login.
+- **Quick Search.** A global shortcut (default ⌃⌥⌘T) opens a small panel that searches
+  titles, abbreviations, text and tags. Return types the snippet into the field you came
+  from (after re-checking it); ⌘Return copies it.
+- **App exclusions.** Pick apps in which Typelune never records typing, expands or inserts.
+- **Backups.** A daily backup before the first change of the day, *Backup Now*, preview and
+  restore with Undo; the newest 30 are kept.
+- **Your data stays local.** One JSON file in Application Support, with JSON import/export,
+  CSV import with a preview ([docs/import.md](docs/import.md)), and merge or replace with
+  Undo.
 
 ## Requirements
 
@@ -66,6 +75,7 @@ saving disabled.
 
 - [Architecture](docs/architecture.md)
 - [Privacy and permissions](docs/privacy.md)
+- [Importing snippets (CSV)](docs/import.md)
 - [Brand](docs/brand.md)
 - [Testing](docs/testing.md)
 - [Releasing](docs/releasing.md)

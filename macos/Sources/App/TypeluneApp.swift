@@ -4,6 +4,18 @@ import AppKit
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            AppModel.live.didFinishLaunching()
+        }
+    }
+
+    /// Closing the window only hides Typelune: it keeps running in the menu bar (with
+    /// system-wide expansion and the Quick Search shortcut). Quit is explicit.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated {
             AppModel.live.shutdown()
@@ -40,6 +52,22 @@ struct TypeluneApp: App {
         }
         .defaultSize(width: 540, height: 700)
 
+        Window("Backups", id: WindowID.backups) {
+            BackupsView()
+                .environment(model)
+                .frame(minWidth: 640, minHeight: 400)
+        }
+        .defaultSize(width: 760, height: 500)
+
+        MenuBarExtra {
+            MenuBarMenu()
+                .environment(model)
+        } label: {
+            Image(systemName: model.menuBarSymbol)
+                .accessibilityLabel("Typelune, system-wide expansion \(model.native?.state.title ?? "Off")")
+        }
+        .menuBarExtraStyle(.menu)
+
         Settings {
             SettingsView()
                 .environment(model)
@@ -51,6 +79,7 @@ enum WindowID {
     static let main = "main"
     static let playground = "playground"
     static let systemWide = "system-wide"
+    static let backups = "backups"
 }
 
 struct AppCommands: Commands {
@@ -69,6 +98,8 @@ struct AppCommands: Commands {
                 .keyboardShortcut("i", modifiers: [.command, .shift])
             Button("Export Library…") { model.exportLibrary() }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
+            Divider()
+            Button("Backups…") { openWindow(id: WindowID.backups) }
         }
         CommandMenu("Snippet") {
             let selected = model.snippetSelection
@@ -91,6 +122,7 @@ struct AppCommands: Commands {
                 .keyboardShortcut("p", modifiers: [.command, .option])
             Button("System-wide Expansion…") { openWindow(id: WindowID.systemWide) }
                 .keyboardShortcut("s", modifiers: [.command, .option])
+            Button("Quick Search") { model.openQuickSearch() }
         }
     }
 }

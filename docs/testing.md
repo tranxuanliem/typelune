@@ -4,7 +4,8 @@ Run everything with `scripts/test-all.sh`. CI runs the same script, then builds 
 runs `scripts/check-identity.sh --app dist/Typelune.app`.
 
 The tests use temporary folders only. They never start system-wide expansion, never post
-keyboard events, and never read or write a real library.
+keyboard events, never register login items or global shortcuts, never change permissions,
+and never read or write a real library, real preferences or real backups.
 
 ## What is covered
 
@@ -27,9 +28,31 @@ keyboard events, and never read or write a real library.
   - other operations' temp files are never removed;
   - invalid, oversized and unreadable sources, and an unwritable target, all fail closed.
 - Save worker: bounded, coalescing, fails closed.
+- Backups:
+  - strict snapshot names; at most one daily snapshot per day, even with 8 racing writers;
+  - today's daily snapshot survives a burst of 35 manual snapshots, and the total never
+    exceeds 30;
+  - invalid, oversized, damaged, folder, named-pipe and symlinked snapshots (and a
+    symlinked backups folder) are refused, never followed, deleted or replaced;
+  - same-second snapshots never overwrite each other; no temp files are left.
+- Preferences: safe defaults (no auto-start), nothing written on read, round trip,
+  validation, corrupt files moved aside, symlinks and newer versions never overwritten.
+- CSV: BOM, quoted commas, line breaks and escaped quotes, CRLF/CR, header rules, line
+  numbers for skipped and duplicate rows, unsupported placeholders and `%` codes kept
+  literal and warned (but not `%` inside supported placeholders), header-only and
+  all-invalid files, size/row/column/field limits, unterminated quotes, invalid UTF-8,
+  named pipes and folders refused without blocking.
+- Reading files: named pipes are refused without blocking (library and import).
 - Native pure logic:
   - key classification and the injection plan;
-  - safety checks;
+  - safety checks, including exclusion (which wins over a matching focus);
+  - the automatic-matching decision: Quick Search typing never feeds the matcher, unknown
+    receiving apps are skipped when exclusions are set;
+  - Quick Search refusals: off, stopping, paused, missing or stale target, Typelune
+    itself, field not identified exactly, excluded app, Secure Keyboard Entry; a manual
+    plan never erases text;
+  - enclosing app bundles and case-insensitive exclusion matching;
+  - a focus change in the middle of a multi-chunk insertion stops before the next event;
   - own-event and own-app filters.
 - Core open:
   - migration;
@@ -44,7 +67,12 @@ the engine into a simulated text field.
 - import, merge and replace;
 - the protected export path;
 - main-thread guards;
-- stop.
+- stop;
+- preferences in the data folder (isolated, safe defaults, validation, persistence);
+- Backup Now, preview, restore with a pre-restore snapshot, refused names and damaged
+  snapshots;
+- CSV preview leaves the library unchanged until merge;
+- Quick Search insertion refused while off; inhibition does not change the run state.
 
 **Keyboard layout** (`tests/keyboard_layout.rs`): keycode translation on the main thread.
 
@@ -52,7 +80,12 @@ the engine into a simulated text field.
 - lossless Codable round-trip against the file on disk;
 - Playground math and typing through the Rust engine;
 - selection rules;
-- calls racing `close()` (lifetime barrier).
+- calls racing `close()` (lifetime barrier);
+- preferences isolation and a cleared shortcut staying cleared;
+- v0.3 libraries stay byte-identical when preferences and backups are used;
+- backups, restore and CSV preview through the bridge;
+- Quick Search ranking and keyboard selection, Insert-vs-Copy availability;
+- shortcut validation, start-at-launch and login-item rules.
 
 **Static checks**
 - `cargo fmt`, and `clippy -D warnings` with and without `legacy-egui`.
@@ -64,9 +97,13 @@ the engine into a simulated text field.
 ## Not covered by automated tests
 
 These need a person at the Mac:
-- the visible UI;
-- file panels;
-- system-wide expansion in real apps.
+- the visible UI, including the menu bar menu and keeping running after the window closes;
+- file panels and the installed-app picker;
+- system-wide expansion in real apps, exclusions in a real app, and Quick Search Insert;
+- the global shortcut (registration, conflicts, use from another app);
+- launch at login (`SMAppService` behaviour depends on where the app is installed and
+  on macOS approval);
+- Undo of a restore in the Backups window.
 
 System-wide expansion in v0.2.0 was checked by hand in Apple Notes with a physical keyboard. The v0.3.0 naming update keeps the injection behavior, but its new bundle identity needs a fresh Accessibility grant before repeating that test. Re-check after any change to `src/native/`.
 
@@ -78,3 +115,61 @@ System-wide expansion in v0.2.0 was checked by hand in Apple Notes with a physic
 - A build from a source folder containing spaces passed without embedded personal home paths.
 - Visible UI: About shows Typelune 0.3.0 and the new icon; Playground expands the English and Vietnamese example rules.
 - First-launch migration was checked byte for byte against the original file, which remained unchanged. System-wide expansion remained off.
+
+## v0.4.0 local validation
+
+Automated, on the final build:
+- Rust: 132 unit tests, 6 end-to-end tests, 15 C ABI tests, and 3 keyboard-layout checks passed.
+- Swift: all 125 bridge checks passed, plus strict formatting and warnings-as-errors typechecking.
+- `cargo fmt`, clippy (with and without `legacy-egui`), the identity self-test, source and bundle
+  identity, and ad-hoc signature verification passed.
+- The Quick Search focus rules (when to hand focus back, what counts as a click-away) are
+  covered by pure policy tests. These test the decisions only, not real AppKit activation or
+  keyboard routing.
+
+Observed in the GUI by the reviewer (synthetic input, isolated `TYPELUNE_DATA_DIR`,
+synthetic data only):
+- CSV: the preview wrote nothing; a UTF-8 file with BOM, CRLF, multi-line Vietnamese text and
+  escaped quotes imported correctly; Merge, Undo and Redo worked.
+- Backups: Backup Now, the daily snapshot before the first save of the day, restore with the
+  pre-restore snapshot kept, and Undo of the restore from the Backups window.
+- Exclusions: adding an app with the installed-app picker; the exclusion survived a relaunch.
+- Quick Search shortcut setting: Clear (stored as no shortcut), Record (a new combination was
+  accepted) and Default.
+- Quick Search opened from the menu: typing filtered, arrow keys moved the selection, Escape
+  closed it; Copy put the exact multi-line Vietnamese text on the clipboard.
+- Playground expansion, and Quit from the menu exits the app.
+- The real library remained byte-identical throughout.
+
+Synthetic GUI typing is not the same as physical keys or a global shortcut pressed in another
+app; those are listed separately below.
+
+Confirmed by a person with a physical keyboard, on the final build, with Accessibility granted
+to that exact build and all Typelune windows closed:
+- With expansion running, an abbreviation followed by Space expanded in Apple Notes.
+- The global shortcut (⌃⌥⌘T) pressed in Notes opened Quick Search. Typing reached the search
+  field, and Return inserted the multi-line Vietnamese snippet into Notes. The reviewer
+  separately checked the native statistics afterwards: running, three expansions, the last
+  Quick Search insert recorded as successful, no aborts. The final Notes text is as reported
+  by the person; Notes was cleared before a screenshot was taken.
+- In TextEdit, which was excluded: the shortcut opened Quick Search and typing reached
+  the search field; Return did not insert
+  (Copy-only, as intended for an excluded app). Pasting afterwards produced the exact
+  multi-line text with Vietnamese diacritics and quotation marks.
+
+On the earlier build, a person also verified that an abbreviation followed by Space stayed
+literal in excluded TextEdit. The exclusion and automatic-matching code did not change in
+the panel activation fix; that particular physical test was not repeated on the final build.
+
+Focus failure found and fixed during this validation: the first v0.4 build used a
+non-activating panel. With all Typelune windows closed, the shortcut opened the panel from
+TextEdit but typing still went to TextEdit, because an inactive app's panel is not guaranteed
+the keyboard. The panel now activates Typelune while it is open and hands focus back to the
+original app afterwards (see architecture.md). The physical results above are on that build.
+
+Not verified:
+- registering the real login item with macOS;
+- input-method composition (marked text) in the Quick Search field;
+- returning focus to the original app after Escape or Copy, and click-away, with real
+  activation (only the policy tests above);
+- staying active in the background over a longer session.
