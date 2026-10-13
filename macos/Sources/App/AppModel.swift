@@ -258,12 +258,18 @@ final class AppModel {
     /// when the library window is closed.
     private func registerUndo(_ actionName: String, restoring snapshot: Library, on manager: UndoManager? = nil) {
         guard let undoManager = manager ?? undoManager else { return }
+        // The handler is `@Sendable` in some SDKs and `UndoManager` is not Sendable, so it
+        // captures a main-actor-isolated weak reference instead. Weak also avoids the manager
+        // retaining itself through its own handler; a window that is gone has no Undo.
+        let ref = UndoManagerRef(undoManager)
         undoManager.registerUndo(withTarget: self) { model in
             MainActor.assumeIsolated {
+                guard let undoManager = ref.manager else { return }
                 let current = model.library
                 let undoing = undoManager.isUndoing
                 model.library = snapshot
                 if model.commitNow() {
+                    // Redo goes on the same (originating window's) manager.
                     model.registerUndo(actionName, restoring: current, on: undoManager)
                     model.ensureSelectionVisible()
                     // Replace any success banner from the original action, which is now stale.
@@ -589,6 +595,15 @@ final class AppModel {
         }
         index = idx
     }
+}
+
+/// Weak reference to an `UndoManager`, isolated to the main actor (and therefore Sendable),
+/// so Undo handlers can refer to the manager they were registered on.
+@MainActor
+private final class UndoManagerRef {
+    weak var manager: UndoManager?
+
+    init(_ manager: UndoManager) { self.manager = manager }
 }
 
 extension String {

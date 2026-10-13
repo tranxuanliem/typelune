@@ -141,10 +141,20 @@ synthetic data only):
 - Playground expansion, and Quit from the menu exits the app.
 - The real library remained byte-identical throughout.
 
+CI compatibility fix after the first push: GitHub CI (Xcode 16.4, macOS 15.5 SDK) refused
+the Undo handler because it captured `UndoManager`, which that SDK does not mark Sendable,
+in a `@Sendable` closure. The handler now captures a main-actor-isolated weak reference to
+the originating window's `UndoManager`, so Redo still goes on the same manager and the
+manager no longer retains itself through its own handler. Locally (macOS 26.5 SDK) all
+checks above pass with this change. The macOS 15.5 SDK is not installed here; GitHub CI
+checks compatibility with that SDK. The reviewer repeated restore, Undo and Redo in the
+Backups window after this fix: five QA snippets became two, Undo restored five, Redo
+restored two, and a final Undo restored five. Each result was checked in the saved QA file.
+
 Synthetic GUI typing is not the same as physical keys or a global shortcut pressed in another
 app; those are listed separately below.
 
-Confirmed by a person with a physical keyboard, on the final build, with Accessibility granted
+Confirmed by a person with a physical keyboard, on the activating-panel build, with Accessibility granted
 to that exact build and all Typelune windows closed:
 - With expansion running, an abbreviation followed by Space expanded in Apple Notes.
 - The global shortcut (⌃⌥⌘T) pressed in Notes opened Quick Search. Typing reached the search
@@ -156,6 +166,9 @@ to that exact build and all Typelune windows closed:
   the search field; Return did not insert
   (Copy-only, as intended for an excluded app). Pasting afterwards produced the exact
   multi-line text with Vietnamese diacritics and quotation marks.
+
+The subsequent SDK compatibility change affected only the Undo reference; the Quick Search
+and native injection code used by these physical tests is unchanged.
 
 On the earlier build, a person also verified that an abbreviation followed by Space stayed
 literal in excluded TextEdit. The exclusion and automatic-matching code did not change in
