@@ -304,8 +304,19 @@ struct QuickSearchView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            Text(availability.canInsert ? "↩ Insert   ⌘↩ Copy" : "↩ Copy")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Button("Copy") { model.quickSearchCopy(nil) }
-                .help("Copy the expanded text (⌘↩)")
+                .help(
+                    availability.canInsert
+                        ? "Copy the expanded text (⌘↩)" : "Copy the expanded text (↩ or ⌘↩)"
+                )
+                .accessibilityHint(
+                    availability.canInsert
+                        ? "Command-Return copies; Return inserts." : "Return or Command-Return copies."
+                )
                 .disabled(model.quickSearch.selection == nil)
             if availability.canInsert {
                 Button("Insert") { model.quickSearchPrimary(nil) }

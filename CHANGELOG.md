@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-13
+
+### Changed
+- Calmer library window; no data, schema or behaviour changes.
+  - **Editor:** the title, abbreviation and *Enabled* switch sit at the top and the text
+    editor fills the window, so the text is visible without scrolling at the minimum window
+    size. Group, tags, trigger mode and case sensitivity moved to an *Options* popover. The
+    rendered preview is a *Preview* disclosure (remembered). The placeholder *Insert* menu is
+    at the bottom left. Warnings and the disabled-group reason stay visible without opening
+    anything.
+  - **Snippet list:** the title is the primary line; the abbreviation is a small monospaced
+    label under it, followed by the group when viewing all snippets.
+  - **Toolbar:** New Snippet, Search snippets and a compact expansion status (Running, Paused,
+    Off or an error). Playground, import/export, backups and New Group are in the Library
+    menu. Menus and shortcuts are unchanged.
+  - **Sidebar:** the "Library" heading is gone.
+  - **Quick Search:** the footer shows what Return does (Insert or Copy) and ⌘Return (Copy).
+
 ## [0.4.0] - 2026-10-13
 
 ### Added
@@ -114,6 +132,7 @@ First public developer preview as **Typelune**.
   - Playground;
   - opt-in macOS system-wide expansion.
 
-[Unreleased]: https://github.com/tranxuanliem/typelune/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/tranxuanliem/typelune/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/tranxuanliem/typelune/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/tranxuanliem/typelune/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/tranxuanliem/typelune/releases/tag/v0.3.0
