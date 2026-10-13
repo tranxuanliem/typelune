@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write      # create the GitHub release
+  id-token: write      # build-provenance attestation
+  attestations: write
+
+jobs:
+  release:
+    name: Pre-release (ad-hoc signed, not notarized)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # scripts need tomllib (3.11+)
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - name: Tag must match Cargo version
+        run: |
+          eval "$(python3 scripts/product.py)"
+          test "${GITHUB_REF_NAME}" = "v${VERSION}" || { echo "tag ${GITHUB_REF_NAME} != v${VERSION}"; exit 1; }
+      - name: All checks
+        run: |
+          scripts/check-identity.sh --self-test
+          scripts/test-all.sh
+      - name: Build app from the tagged source
+        run: scripts/build-app.sh
+      - name: Verify bundle identity and signature
+        run: scripts/check-identity.sh --app dist/Typelune.app
+      - name: Package
+        id: package
+        run: |
+          eval "$(python3 scripts/product.py)"
+          name="Typelune-${VERSION}-macos-arm64-unsigned.zip"
+          ditto -c -k --keepParent "dist/${APP_BUNDLE}" "dist/${name}"
+          (cd dist && shasum -a 256 "${name}" > SHA256SUMS.txt)
+          echo "zip=dist/${name}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ steps.package.outputs.zip }}
+      - name: Create GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ATTESTED=1 scripts/release-notes.sh > dist/RELEASE_NOTES.md
+          gh release create "${GITHUB_REF_NAME}" \
+            "${{ steps.package.outputs.zip }}" dist/SHA256SUMS.txt \
+            --prerelease \
+            --title "Typelune ${{ steps.package.outputs.version }} (developer preview, not notarized)" \
+            --notes-file dist/RELEASE_NOTES.md

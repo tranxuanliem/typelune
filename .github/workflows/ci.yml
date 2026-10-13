@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS (arm64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # scripts need tomllib (3.11+)
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Toolchain info
+        run: |
+          sw_vers
+          swift --version
+          xcrun --sdk macosx --show-sdk-path
+          rustc --version
+      - name: Identity detector self-test
+        run: scripts/check-identity.sh --self-test
+      - name: All checks
+        run: scripts/test-all.sh
+      - name: Build app
+        run: scripts/build-app.sh
+      - name: Verify bundle identity and signature
+        run: scripts/check-identity.sh --app dist/Typelune.app

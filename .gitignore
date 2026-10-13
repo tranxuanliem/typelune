@@ -1,0 +1,5 @@
+/target
+/dist
+# Local-only material: research notes, QA/session logs, install provenance, legacy assets.
+/private/
+.DS_Store

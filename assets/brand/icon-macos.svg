@@ -1,0 +1,22 @@
+<!--
+  Typelune icon — conventional macOS (.icns) artwork for 128–1024 px.
+  The layer source (icon-layer.svg) placed on the classic macOS icon grid: 824×824 body
+  centred in 1024 with corner radius 185. Everything outside the body is transparent.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#222D3A"/>
+      <stop offset="1" stop-color="#161D27"/>
+    </linearGradient>
+    <clipPath id="body"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>
+  </defs>
+  <g clip-path="url(#body)">
+    <g transform="translate(100 100) scale(0.8046875)">
+      <rect width="1024" height="1024" fill="url(#ink)"/>
+      <path d="M310.72,260.40 A196,196 0 1,0 540.75,504.80 A168,168 0 1,1 310.72,260.40 Z" fill="#F2B544"/>
+      <rect x="352" y="620" width="416" height="64" rx="32" fill="#F6F4EF"/>
+      <rect x="800" y="560" width="32" height="184" rx="16" fill="#F6F4EF" opacity="0.9"/>
+    </g>
+  </g>
+</svg>

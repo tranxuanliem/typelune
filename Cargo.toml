@@ -1,0 +1,67 @@
+[package]
+name = "typelune-core"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Rust core of Typelune, a native macOS text expander: matching, templates, storage and opt-in system-wide expansion"
+license = "MIT"
+repository = "https://github.com/tranxuanliem/typelune"
+readme = "README.md"
+publish = false
+
+# Canonical product identity. scripts/build-app.sh generates Info.plist from this table and
+# scripts/check-identity.sh fails if the bundle, binary or docs disagree with it.
+[package.metadata.typelune]
+product_name = "Typelune"
+bundle_id = "io.github.tranxuanliem.typelune"
+executable = "Typelune"
+app_bundle = "Typelune.app"
+minimum_macos = "15.0"
+copyright = "Copyright © 2026 Liem Tran. MIT License."
+data_dir_env = "TYPELUNE_DATA_DIR"
+legacy_data_dir_env = "ATEXT_RS_DATA_DIR"
+legacy_bundle_id = "dev.atext-rs.poc"
+c_header = "include/typelune_core.h"
+c_prefix = "tpl_"
+abi_version = 2
+
+[lib]
+name = "typelune_core"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
+
+# Legacy egui interface from v0.1, kept as an optional developer fallback; never bundled.
+[[bin]]
+name = "typelune-egui"
+path = "src/main.rs"
+required-features = ["legacy-egui"]
+
+[features]
+default = []
+legacy-egui = ["dep:eframe", "dep:rfd"]
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "accesskit"], optional = true }
+rfd = { version = "0.17", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+arboard = { version = "3", default-features = false }
+dirs = "6"
+sha2 = "0.10"
+unicode-segmentation = "1"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# Runs on the main thread (TextInputSources is main-thread only), so no libtest harness.
+[[test]]
+name = "keyboard_layout"
+harness = false

@@ -1,0 +1,4 @@
+<!-- Typelune wordmark (original monoline letterforms drawn as paths; MIT). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-24 16 392 136" width="1176" height="408" role="img" aria-label="Typelune">
+  <path d="M8,44 V92 Q8,100 16,100 H20 M0,64 H20 M34,64 L51,100 M68,64 L46,128 M82,64 V128 M82,82 A18,18 0 1,1 118,82 A18,18 0 1,1 82,82 M133,82 H169 A18,18 0 1,0 164,95 M188,40 V100 M206,64 V82 A18,18 0 0,0 242,82 M242,64 V100 M256,100 V64 M256,82 A18,18 0 0,1 292,82 V100 M307,82 H343 A18,18 0 1,0 338,95" fill="none" stroke="#1E2733" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

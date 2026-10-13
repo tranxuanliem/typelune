@@ -1,0 +1,22 @@
+<!--
+  Typelune icon — layer source (original artwork, MIT).
+  Full-bleed, unmasked 1024×1024 square per Apple's guidance for modern icon layers:
+  no baked rounded corners, no shadow. Layers (bottom → top):
+    1. background  – Ink gradient (#222D3A → #161D27)
+    2. lune        – Amber (#F2B544) crescent: the short typed mark
+    3. line        – Paper (#F6F4EF) long line: the expanded text
+    4. caret       – Paper caret at the end of the line
+  The crescent is circle (352,452) r196 minus circle (420,388) r168, drawn as one path.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#222D3A"/>
+      <stop offset="1" stop-color="#161D27"/>
+    </linearGradient>
+  </defs>
+  <g id="background"><rect width="1024" height="1024" fill="url(#ink)"/></g>
+  <g id="lune"><path d="M310.72,260.40 A196,196 0 1,0 540.75,504.80 A168,168 0 1,1 310.72,260.40 Z" fill="#F2B544"/></g>
+  <g id="line"><rect x="352" y="620" width="416" height="64" rx="32" fill="#F6F4EF"/></g>
+  <g id="caret"><rect x="800" y="560" width="32" height="184" rx="16" fill="#F6F4EF" opacity="0.9"/></g>
+</svg>
