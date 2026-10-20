@@ -66,8 +66,8 @@ page.
   **excluded apps** (Settings › Exclusions) for apps where that matters: in them, typing is
   not recorded or matched and nothing is inserted. Apps are identified by bundle
   identifier; a process that is not inside an app bundle cannot be excluded. When
-  exclusions are set and the receiving app of a key cannot be identified, the key is
-  ignored.
+  the receiving app of a key cannot be identified, the key is always ignored and matching
+  is reset, regardless of exclusions.
 - Typing in Typelune's own windows is ignored. The Playground has its own matcher.
 
 **Before any text is replaced**, and again before every synthetic key, Typelune checks that:

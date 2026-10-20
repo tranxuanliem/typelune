@@ -625,8 +625,8 @@ struct Shared {
     /// Excluded bundle identifiers, lower-case.
     excluded: Mutex<HashSet<String>>,
     bundles: Mutex<HashMap<i32, (String, Vec<String>)>>,
-    /// Frontmost app as reported by the UI (NSWorkspace), used when a key event carries no
-    /// target PID. 0 = unknown.
+    /// Frontmost app reported by the UI (NSWorkspace), used only to reset on activation
+    /// changes, never as an event-target fallback. 0 = unknown.
     frontmost_pid: AtomicI32,
     /// App that received the previous key event (0 = none); a change resets matching.
     last_key_pid: AtomicI32,
@@ -687,7 +687,8 @@ impl Shared {
 struct Job {
     expansion: Expansion,
     generation: u64,
-    /// Target PID of the triggering key event, if macOS supplied one.
+    /// Positive receiving PID bound when an automatic match is queued. Manual jobs use
+    /// `manual_origin` instead.
     target_pid: Option<i32>,
     /// Quick Search: the target captured before the panel opened. Injection waits for it to
     /// be focused again and never deletes anything.
@@ -1291,8 +1292,28 @@ fn receiving_pid(target_pid: i64, focused_pid: impl FnOnce() -> Option<i32>) -> 
         // Invalid explicit targets fail closed; never wrap a PID or replace it with focus.
         i32::try_from(target_pid).ok()
     } else {
-        Some(focused_pid().filter(|pid| *pid > 0).unwrap_or(0))
+        focused_pid().filter(|pid| *pid > 0)
     }
+}
+
+/// Cancel interrupted matching before any key can be fed to the engine.
+fn handle_receiving_process(shared: &Shared, pid: Option<i32>) -> Option<i32> {
+    let Some(key_pid) = pid else {
+        shared.cancel_pending();
+        shared.reset_engine();
+        bump(shared, |d| d.unknown_target_skips += 1);
+        return None;
+    };
+    if key_pid > 0 {
+        let previous = shared.last_key_pid.swap(key_pid, Ordering::SeqCst);
+        if previous != 0 && previous != key_pid {
+            // Typing moved to another app: what was typed before is not context any more.
+            shared.cancel_pending();
+            shared.reset_engine();
+            bump(shared, |d| d.focus_change_resets += 1);
+        }
+    }
+    Some(key_pid)
 }
 
 /// Key events delivered to this app are not matched globally (the app has its own
@@ -1394,21 +1415,11 @@ fn handle_event(ctx: &TapContext, event_type: u32, event: CGEventRef) {
     }
     // An explicit event target remains authoritative. Without one, use keyboard
     // focus rather than NSWorkspace's active app (which can sit behind a panel).
-    let Some(key_pid) = receiving_pid(info.target_pid, keyboard_focus_pid) else {
-        shared.cancel_pending();
-        shared.reset_engine();
-        bump(shared, |d| d.unknown_target_skips += 1);
+    let Some(key_pid) =
+        handle_receiving_process(shared, receiving_pid(info.target_pid, keyboard_focus_pid))
+    else {
         return;
     };
-    if key_pid > 0 {
-        let previous = shared.last_key_pid.swap(key_pid, Ordering::SeqCst);
-        if previous != 0 && previous != key_pid {
-            // Typing moved to another app: what was typed before is not context any more.
-            shared.cancel_pending();
-            shared.reset_engine();
-            bump(shared, |d| d.focus_change_resets += 1);
-        }
-    }
     let exclusions_set = shared
         .excluded
         .lock()
@@ -1488,7 +1499,7 @@ fn handle_event(ctx: &TapContext, event_type: u32, event: CGEventRef) {
                 expansion,
                 generation: shared.generation.load(Ordering::SeqCst),
                 // Bound to the app the key was attributed to; the injector refuses any other.
-                target_pid: (key_pid > 0).then_some(key_pid),
+                target_pid: Some(key_pid),
                 manual_origin: None,
             };
             shared.injecting.store(true, Ordering::SeqCst);
@@ -1583,6 +1594,10 @@ fn inject(
     source: CGEventSourceRef,
     job: &Job,
 ) -> Result<Option<String>, (AbortReason, bool, Option<String>)> {
+    // Reject unbound automatic jobs before any AX query or native event work.
+    if job.manual_origin.is_none() && !job.target_pid.is_some_and(|pid| pid > 0) {
+        return Err((AbortReason::FocusUnknown, false, None));
+    }
     let captured;
     let origin: &FocusIdentity = match &job.manual_origin {
         Some(target) => {
@@ -1836,8 +1851,63 @@ mod tests {
             Some(7)
         );
         assert_eq!(receiving_pid(i64::MAX, || Some(42)), None);
-        assert_eq!(receiving_pid(0, || None), Some(0));
-        assert_eq!(receiving_pid(0, || Some(-1)), Some(0));
+        assert_eq!(receiving_pid(0, || None), None);
+        assert_eq!(receiving_pid(0, || Some(-1)), None);
+        assert_eq!(receiving_pid(0, || Some(0)), None);
+        assert_eq!(receiving_pid(-1, || None), None);
+    }
+
+    #[test]
+    fn failed_receiver_lookup_interrupts_matching_without_exclusions() {
+        use crate::model::{Group, SnippetTrigger};
+        let controller = NativeController::new(); // State only; never start expansion.
+        let shared = &controller.shared;
+        let mut group = Group::new("test");
+        group
+            .snippets
+            .push(Snippet::new("", "abc", "replacement").trigger(SnippetTrigger::Immediate));
+        shared.engine.lock().unwrap().load(&Library {
+            groups: vec![group],
+            ..Library::empty()
+        });
+        assert!(shared.excluded.lock().unwrap().is_empty());
+        assert_eq!(handle_receiving_process(shared, Some(42)), Some(42));
+        assert!(shared.engine.lock().unwrap().feed_str("ab").is_empty());
+        assert_eq!(shared.engine.lock().unwrap().buffer(), "ab");
+        let generation = shared.generation.load(Ordering::SeqCst);
+        assert_eq!(
+            handle_receiving_process(shared, receiving_pid(0, || None)),
+            None
+        );
+        assert!(shared.generation.load(Ordering::SeqCst) > generation);
+        assert!(shared.engine.lock().unwrap().buffer().is_empty());
+        assert_eq!(handle_receiving_process(shared, Some(42)), Some(42));
+        assert!(shared.engine.lock().unwrap().feed_str("c").is_empty());
+        assert_eq!(shared.engine.lock().unwrap().feed_str(" abc").len(), 1);
+    }
+
+    #[test]
+    fn automatic_injection_rejects_unbound_targets_before_native_work() {
+        let controller = NativeController::new();
+        for target_pid in [None, Some(0), Some(-1)] {
+            let job = Job {
+                expansion: Expansion {
+                    snippet_id: uuid::Uuid::nil(),
+                    title: String::new(),
+                    abbreviation: String::new(),
+                    typed: String::new(),
+                    body: String::new(),
+                    suffix: String::new(),
+                },
+                generation: 0,
+                target_pid,
+                manual_origin: None,
+            };
+            assert_eq!(
+                inject(&controller.shared, std::ptr::null_mut(), &job),
+                Err((AbortReason::FocusUnknown, false, None))
+            );
+        }
     }
 
     #[test]

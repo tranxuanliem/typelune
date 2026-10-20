@@ -47,7 +47,7 @@ and never read or write a real library, real preferences or real backups.
   - key classification and the injection plan;
   - safety checks, including exclusion (which wins over a matching focus);
   - the automatic-matching decision: Quick Search typing never feeds the matcher, unknown
-    receiving apps are skipped when exclusions are set;
+    receiving apps always cancel pending work and reset matching, regardless of exclusions;
   - Quick Search refusals: off, stopping, paused, missing or stale target, Typelune
     itself, field not identified exactly, excluded app, Secure Keyboard Entry; a manual
     plan never erases text;
@@ -201,3 +201,8 @@ expansion explicitly enabled in a controlled session, check expansion in its que
 while another app remains active, exclusions for Raycast, focus changes during insertion,
 and Secure Keyboard Entry refusal. Also check ordinary app expansion and Quick Search's
 exact-field return requirement. Do not run this manual procedure as part of automated tests.
+
+Unknown-target automatic jobs are rejected before Accessibility queries or event work.
+The regression tests construct controller state only and never start the tap. The 5 ms AX
+timeout remains unmeasured in real insertion flows; a timeout after insertion begins can
+leave a partial replacement. This correction does not change that latency design.

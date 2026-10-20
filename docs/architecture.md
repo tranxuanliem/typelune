@@ -68,7 +68,7 @@ Accessibility is already granted; otherwise it reports why it did not start.
 **App exclusions** (bundle identifiers) are checked twice:
 - in the event tap, before a key is recorded or matched: the receiving app is the key
   event's target PID, else the owner of the system-wide Accessibility focused element.
-  If exclusions are set and the receiving app is unknown, the key is skipped. Switching
+  If the receiving app is unknown, the key is always skipped and matching is reset. Switching
   apps resets matching;
 - in the injector, right before every synthetic key (see below).
 
