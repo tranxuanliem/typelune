@@ -443,6 +443,57 @@ struct FocusIdentity {
 // between threads, never used concurrently.
 unsafe impl Send for FocusIdentity {}
 
+// None means no element; Some(None) means an exposed element with an unreadable PID.
+// Never turn an invalid or inconsistent element into an app-only identity.
+fn focused_owner(element_pid: Option<Option<i32>>, app_pid: Option<i32>) -> Option<i32> {
+    match element_pid {
+        Some(pid) => pid.filter(|pid| *pid > 0 && app_pid.is_none_or(|app| app == *pid)),
+        None => app_pid.filter(|pid| *pid > 0),
+    }
+}
+
+unsafe fn ax_pid(element: AXUIElementRef) -> Option<i32> {
+    let mut pid = 0;
+    // SAFETY: caller supplies a live AX element; pid points to writable storage.
+    (AXUIElementGetPid(element, &mut pid) == 0 && pid > 0).then_some(pid)
+}
+
+// AX messaging timeouts are process-wide when set on the system object. Keep all
+// focus queries short, including injector queries, so they cannot lengthen tap queries.
+const FOCUS_QUERY_TIMEOUT: f32 = 0.005;
+
+fn keyboard_focus_pid() -> Option<i32> {
+    // SAFETY: all copied/created CF objects are released; no field contents are read.
+    unsafe {
+        let system = AXUIElementCreateSystemWide();
+        if system.is_null() {
+            return None;
+        }
+        if AXUIElementSetMessagingTimeout(system, FOCUS_QUERY_TIMEOUT) != 0 {
+            CFRelease(system);
+            return None;
+        }
+        // The tap uses just one bounded attribute query, without app-level fallback.
+        let element = copy_ax_attribute(system, "AXFocusedUIElement");
+        let element = match element {
+            Ok(element) => element,
+            Err(()) => {
+                CFRelease(system);
+                return None;
+            }
+        };
+        let pid = if element.is_null() {
+            None
+        } else {
+            let pid = ax_pid(element);
+            CFRelease(element);
+            pid
+        };
+        CFRelease(system);
+        pid
+    }
+}
+
 impl FocusIdentity {
     fn capture() -> Option<Self> {
         // SAFETY: standard AX calls; every created/copied object is released below.
@@ -451,17 +502,40 @@ impl FocusIdentity {
             if system.is_null() {
                 return None;
             }
-            AXUIElementSetMessagingTimeout(system, 0.25);
-            let app = copy_ax_attribute(system, "AXFocusedApplication");
-            let mut result = None;
-            if !app.is_null() {
-                let mut pid: i32 = 0;
-                if AXUIElementGetPid(app, &mut pid) == 0 && pid > 0 {
-                    let element = copy_ax_attribute(system, "AXFocusedUIElement");
-                    result = Some(FocusIdentity { pid, element });
-                }
-                CFRelease(app);
+            if AXUIElementSetMessagingTimeout(system, FOCUS_QUERY_TIMEOUT) != 0 {
+                CFRelease(system);
+                return None;
             }
+            let result = (|| {
+                // A global query error is not evidence that no element exists. Never
+                // fall back to the active app behind a panel after an IPC failure.
+                let mut element = copy_ax_attribute(system, "AXFocusedUIElement").ok()?;
+                let mut app_pid = None;
+                if element.is_null() {
+                    let app = copy_ax_attribute(system, "AXFocusedApplication").ok()?;
+                    if !app.is_null() {
+                        let fallback = (|| {
+                            if AXUIElementSetMessagingTimeout(app, FOCUS_QUERY_TIMEOUT) != 0 {
+                                return None;
+                            }
+                            let pid = ax_pid(app)?;
+                            let element = copy_ax_attribute(app, "AXFocusedUIElement").ok()?;
+                            Some((pid, element))
+                        })();
+                        CFRelease(app);
+                        let (pid, focused) = fallback?;
+                        app_pid = Some(pid);
+                        element = focused;
+                    }
+                }
+                let element_pid = (!element.is_null()).then(|| ax_pid(element));
+                let pid = focused_owner(element_pid, app_pid);
+                let result = pid.map(|pid| FocusIdentity { pid, element });
+                if result.is_none() && !element.is_null() {
+                    CFRelease(element);
+                }
+                result
+            })();
             CFRelease(system);
             result
         }
@@ -489,8 +563,18 @@ impl Drop for FocusIdentity {
     }
 }
 
-/// Copy an AX attribute by name. Returns a retained object or null.
-unsafe fn copy_ax_attribute(element: AXUIElementRef, name: &str) -> CFTypeRef {
+// AXError.h: only unsupported/noValue mean an absent attribute. In particular,
+// cannotComplete (-25204, including IPC timeouts) must not enable app fallback.
+fn ax_attribute_present(status: i32) -> Result<bool, ()> {
+    match status {
+        0 => Ok(true),
+        -25205 | -25212 => Ok(false),
+        _ => Err(()),
+    }
+}
+
+/// Copy an AX attribute; null means absent, Err means querying failed.
+unsafe fn copy_ax_attribute(element: AXUIElementRef, name: &str) -> Result<CFTypeRef, ()> {
     let attr = CFStringCreateWithBytes(
         std::ptr::null(),
         name.as_ptr(),
@@ -499,18 +583,23 @@ unsafe fn copy_ax_attribute(element: AXUIElementRef, name: &str) -> CFTypeRef {
         0,
     );
     if attr.is_null() {
-        return std::ptr::null();
+        return Err(());
     }
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr, &mut value);
     CFRelease(attr);
-    if err != 0 {
-        if !value.is_null() {
-            CFRelease(value);
+    match ax_attribute_present(err) {
+        Ok(true) if !value.is_null() => Ok(value),
+        status => {
+            if !value.is_null() {
+                CFRelease(value);
+            }
+            match status {
+                Ok(false) => Ok(std::ptr::null()),
+                _ => Err(()),
+            }
         }
-        return std::ptr::null();
     }
-    value
 }
 
 // ---- Shared state ---------------------------------------------------------------------
@@ -1196,6 +1285,16 @@ fn is_own_event(info: &KeyEventInfo) -> bool {
     info.marker == SYNTHETIC_MARKER || info.source_pid == std::process::id() as i64
 }
 
+/// Resolve the receiving process without substituting the active application.
+fn receiving_pid(target_pid: i64, focused_pid: impl FnOnce() -> Option<i32>) -> Option<i32> {
+    if target_pid > 0 {
+        // Invalid explicit targets fail closed; never wrap a PID or replace it with focus.
+        i32::try_from(target_pid).ok()
+    } else {
+        Some(focused_pid().filter(|pid| *pid > 0).unwrap_or(0))
+    }
+}
+
 /// Key events delivered to this app are not matched globally (the app has its own
 /// Playground engine). Only a positive, exact PID match counts; 0 means "unknown".
 fn targets_own_process(target_pid: i64, own_pid: u32) -> bool {
@@ -1293,12 +1392,13 @@ fn handle_event(ctx: &TapContext, event_type: u32, event: CGEventRef) {
         });
         return;
     }
-    // Which app receives this key: the event's target PID, else the frontmost app (as
-    // reported by the UI). 0 = unknown.
-    let key_pid = if info.target_pid > 0 {
-        info.target_pid as i32
-    } else {
-        shared.frontmost_pid.load(Ordering::SeqCst)
+    // An explicit event target remains authoritative. Without one, use keyboard
+    // focus rather than NSWorkspace's active app (which can sit behind a panel).
+    let Some(key_pid) = receiving_pid(info.target_pid, keyboard_focus_pid) else {
+        shared.cancel_pending();
+        shared.reset_engine();
+        bump(shared, |d| d.unknown_target_skips += 1);
+        return;
     };
     if key_pid > 0 {
         let previous = shared.last_key_pid.swap(key_pid, Ordering::SeqCst);
@@ -1705,6 +1805,39 @@ mod tests {
     fn release(ev: CGEventRef) {
         // SAFETY: we own the event.
         unsafe { CFRelease(ev as CFTypeRef) };
+    }
+
+    #[test]
+    fn only_absent_ax_attributes_allow_focus_fallback() {
+        assert_eq!(ax_attribute_present(0), Ok(true));
+        assert_eq!(ax_attribute_present(-25205), Ok(false)); // unsupported
+        assert_eq!(ax_attribute_present(-25212), Ok(false)); // no value
+        assert_eq!(ax_attribute_present(-25204), Err(())); // timeout/cannotComplete
+        assert_eq!(ax_attribute_present(-25202), Err(())); // invalid element
+        assert_eq!(ax_attribute_present(-25211), Err(())); // API disabled
+    }
+
+    #[test]
+    fn panel_focus_uses_element_owner_and_rejects_inconsistent_fallback() {
+        assert_eq!(focused_owner(Some(Some(42)), None), Some(42));
+        assert_eq!(focused_owner(Some(Some(42)), Some(42)), Some(42));
+        assert_eq!(focused_owner(Some(Some(42)), Some(7)), None);
+        assert_eq!(focused_owner(Some(None), Some(7)), None);
+        assert_eq!(focused_owner(Some(Some(0)), None), None);
+        assert_eq!(focused_owner(None, Some(7)), Some(7));
+        assert_eq!(focused_owner(None, None), None);
+    }
+
+    #[test]
+    fn receiving_process_uses_focus_only_without_an_explicit_target() {
+        assert_eq!(receiving_pid(0, || Some(42)), Some(42));
+        assert_eq!(
+            receiving_pid(7, || panic!("must not replace event target")),
+            Some(7)
+        );
+        assert_eq!(receiving_pid(i64::MAX, || Some(42)), None);
+        assert_eq!(receiving_pid(0, || None), Some(0));
+        assert_eq!(receiving_pid(0, || Some(-1)), Some(0));
     }
 
     #[test]

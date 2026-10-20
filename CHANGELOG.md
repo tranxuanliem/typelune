@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Identify keyboard focus by its Accessibility element owner so nonactivating panels
+  such as Raycast can expand snippets while another app remains active.
+
 ## [0.4.1] - 2026-10-13
 
 ### Changed

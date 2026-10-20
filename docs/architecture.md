@@ -67,13 +67,30 @@ Accessibility is already granted; otherwise it reports why it did not start.
 
 **App exclusions** (bundle identifiers) are checked twice:
 - in the event tap, before a key is recorded or matched: the receiving app is the key
-  event's target PID, else the frontmost app reported by the UI. If exclusions are set and
-  the receiving app is unknown, the key is skipped. Switching apps resets matching;
+  event's target PID, else the owner of the system-wide Accessibility focused element.
+  If exclusions are set and the receiving app is unknown, the key is skipped. Switching
+  apps resets matching;
 - in the injector, right before every synthetic key (see below).
 
 The bundle identifiers of a process come from its executable path (`proc_pidpath`) and the
 enclosing `.app` bundles (CoreFoundation `CFBundle`), cached per PID and re-validated by
 path.
+
+Keyboard focus is resolved from the system-wide `AXFocusedUIElement` and its
+`AXUIElementGetPid` owner, independently of the active application. This handles
+nonactivating panels such as Raycast. If the system exposes no focused element, the
+fallback is `AXFocusedApplication` and that application's `AXFocusedUIElement`; an
+exposed fallback element must belong to that application. Only unsupported/no-value
+attribute responses permit fallback; IPC timeouts and other query errors abort capture.
+Unreadable or inconsistent element ownership fails closed. An app-only identity remains possible when no element
+is exposed; Quick Search still requires an exact element. An explicit key-event target
+must still match the captured focus owner, and focus is re-read before every posted event.
+No event-target PID is used to manufacture an Accessibility focus identity. The event
+tap uses only one focused-element query without application fallback. AX messaging has
+a 5 ms timeout (also set explicitly on fallback application objects); injector queries
+use the same short timeout because the system-object setting is process-wide. This
+bounds AX IPC waiting but does not establish a measured end-to-end tap latency guarantee.
+An out-of-range explicit event target skips matching even with no exclusions configured.
 
 **Quick Search insertion** reuses the injector:
 1. Before the panel opens, automatic matching is suspended (inhibited) so search typing
