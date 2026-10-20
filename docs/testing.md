@@ -47,13 +47,18 @@ and never read or write a real library, real preferences or real backups.
   - key classification and the injection plan;
   - safety checks, including exclusion (which wins over a matching focus);
   - the automatic-matching decision: Quick Search typing never feeds the matcher, unknown
-    receiving apps are skipped when exclusions are set;
+    receiving apps always cancel pending work and reset matching, regardless of exclusions;
   - Quick Search refusals: off, stopping, paused, missing or stale target, Typelune
     itself, field not identified exactly, excluded app, Secure Keyboard Entry; a manual
     plan never erases text;
   - enclosing app bundles and case-insensitive exclusion matching;
   - a focus change in the middle of a multi-chunk insertion stops before the next event;
-  - own-event and own-app filters.
+  - own-event and own-app filters;
+  - pure macOS focus-owner selection: panel element ownership, consistent application
+    fallback, missing/invalid element PIDs, rejection of mismatched fallback ownership,
+    and AX timeout/error responses distinguished from absent attributes;
+  - pure receiving-process selection: explicit event targets take precedence, missing
+    targets use AX focus, and out-of-range targets fail closed.
 - Core open:
   - migration;
   - fail-closed cases (no demo data, edits refused).
@@ -186,3 +191,18 @@ Not verified:
 - returning focus to the original app after Escape or Copy, and click-away, with real
   activation (only the policy tests above);
 - staying active in the background over a longer session.
+
+### Nonactivating panel compatibility
+
+The focus-owner and receiving-process regressions use pure values, without reading live
+fields or posting events. They do not prove that a particular Raycast release exposes
+its query field through Accessibility. Real Raycast verification remains manual: with
+expansion explicitly enabled in a controlled session, check expansion in its query field
+while another app remains active, exclusions for Raycast, focus changes during insertion,
+and Secure Keyboard Entry refusal. Also check ordinary app expansion and Quick Search's
+exact-field return requirement. Do not run this manual procedure as part of automated tests.
+
+Unknown-target automatic jobs are rejected before Accessibility queries or event work.
+The regression tests construct controller state only and never start the tap. The 5 ms AX
+timeout remains unmeasured in real insertion flows; a timeout after insertion begins can
+leave a partial replacement. This correction does not change that latency design.

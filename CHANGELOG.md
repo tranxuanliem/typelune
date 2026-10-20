@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Skip unknown receiving apps and reset interrupted matches regardless of exclusions;
+  reject automatic insertion jobs without a positive bound target.
+- Identify keyboard focus by its Accessibility element owner so nonactivating panels
+  such as Raycast can expand snippets while another app remains active.
+
 ## [0.4.1] - 2026-10-13
 
 ### Changed
