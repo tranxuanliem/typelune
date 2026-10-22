@@ -49,7 +49,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 uuid = { version = "1", features = ["v4", "serde"] }
 arboard = { version = "3", default-features = false }
 dirs = "6"
-sha2 = "0.10"
+sha2 = "0.11"
 unicode-segmentation = "1"
 unicode-normalization = "0.1"
 
